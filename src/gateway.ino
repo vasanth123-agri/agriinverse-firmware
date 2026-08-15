@@ -854,7 +854,7 @@ void mqttTask(void* param) {
                 mqttOnline        = false;
                 dState.mqttOnline = false;
                 nextRetry  = now + retryDelay;
-                retryDelay = min(retryDelay * 2, MQTT_RETRY_MAX_MS);
+                retryDelay = min(retryDelay * 2, (uint32_t)MQTT_RETRY_MAX_MS);
             }
             break;
 
