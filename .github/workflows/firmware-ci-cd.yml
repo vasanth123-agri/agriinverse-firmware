@@ -1,4 +1,4 @@
-﻿name: Firmware CI/CD
+name: Firmware CI/CD
 
 on:
   push:
@@ -33,11 +33,15 @@ jobs:
         run: pip install -U platformio
 
       - name: Inject AWS IoT credentials
+        env:
+          ROOT_CA: ${{ secrets.AWS_ROOT_CA_H }}
+          CERTIFICATE: ${{ secrets.AWS_CERTIFICATE_H }}
+          PRIVATE_KEY: ${{ secrets.AWS_PRIVATE_KEY_H }}
         run: |
           mkdir -p src
-          printf '%s' "${{ secrets.AWS_ROOT_CA_H }}"    > src/root_ca.h
-          printf '%s' "${{ secrets.AWS_CERTIFICATE_H }}" > src/certificate.h
-          printf '%s' "${{ secrets.AWS_PRIVATE_KEY_H }}" > src/privatekey.h
+          printf '%s' "$ROOT_CA" > src/root_ca.h
+          printf '%s' "$CERTIFICATE" > src/certificate.h
+          printf '%s' "$PRIVATE_KEY" > src/privatekey.h
 
       - name: Build firmware
         run: pio run -e esp32dev
