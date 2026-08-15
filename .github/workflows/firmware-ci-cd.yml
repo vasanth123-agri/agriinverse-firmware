@@ -1,0 +1,71 @@
+﻿name: Firmware CI/CD
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - '*-v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python (for PlatformIO)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Inject AWS IoT credentials
+        run: |
+          mkdir -p src
+          printf '%s' "${{ secrets.AWS_ROOT_CA_H }}"    > src/root_ca.h
+          printf '%s' "${{ secrets.AWS_CERTIFICATE_H }}" > src/certificate.h
+          printf '%s' "${{ secrets.AWS_PRIVATE_KEY_H }}" > src/privatekey.h
+
+      - name: Build firmware
+        run: pio run -e esp32dev
+
+      - name: Rename artifact with version tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p dist
+          cp .pio/build/esp32dev/firmware.bin "dist/${GITHUB_REF_NAME}.bin"
+
+      - name: Upload build artifact (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: .pio/build/esp32dev/firmware.bin
+          retention-days: 14
+
+      - name: Create GitHub Release with firmware .bin
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ github.ref_name }}.bin
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Print OTA URL
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "OTA url for this build:"
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ github.ref_name }}.bin"

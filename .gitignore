@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+src/certificate.h
+src/privatekey.h
+src/root_ca.h
+*.bin.local
