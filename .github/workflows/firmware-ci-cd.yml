@@ -44,32 +44,35 @@ jobs:
           printf '%s' "$PRIVATE_KEY" > src/privatekey.h
 
       - name: Build firmware
-        run: pio run -e esp32dev
+        run: pio run -e gateway -e valve_node
 
-      - name: Rename artifact with version tag
+      - name: Rename artifacts with version tag
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir -p dist
-          cp .pio/build/esp32dev/firmware.bin "dist/${GITHUB_REF_NAME}.bin"
+          cp .pio/build/gateway/firmware.bin "dist/gateway-${GITHUB_REF_NAME}.bin"
+          cp .pio/build/valve_node/firmware.bin "dist/valve_node-${GITHUB_REF_NAME}.bin"
 
       - name: Upload build artifact (every run)
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ github.sha }}
-          path: .pio/build/esp32dev/firmware.bin
+          path: .pio/build/**/firmware.bin
           retention-days: 14
 
       - name: Create GitHub Release with firmware .bin
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ github.ref_name }}.bin
+          files: dist/*.bin
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Print OTA URL
+      - name: Print OTA URLs
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          echo "OTA url for this build:"
-          echo "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ github.ref_name }}.bin"
+          echo "Gateway OTA url:"
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/gateway-${{ github.ref_name }}.bin"
+          echo "Valve node OTA url:"
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/valve_node-${{ github.ref_name }}.bin"
