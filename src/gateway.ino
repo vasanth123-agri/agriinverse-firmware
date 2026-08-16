@@ -43,6 +43,8 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <HTTPUpdate.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -639,6 +641,65 @@ void publishOtaAck(bool success, const char* deviceId, const char* nodeType, con
     }
 }
 
+// Self-OTA for gateway-type devices (VMCgateway, appliances gateway,
+// fertigation gateway, sensor gateway) — joins wifi_ssid/wifi_pass
+// separately from the LTE modem link, downloads url, and flashes itself.
+// A successful flash reboots the board automatically; the ota_ack is only
+// reachable on failure, since success never returns.
+void selfOtaUpdate(const char* deviceType, const char* uid,
+                   const char* ssid, const char* pass, const char* url) {
+    if (!ssid || !strlen(ssid) || !pass || !strlen(pass)) {
+        Serial.println("❌ Gateway OTA: missing wifi_ssid/wifi_pass");
+        publishOtaAck(false, uid, deviceType, "missing wifi credentials");
+        return;
+    }
+
+    Serial.printf("📶 Gateway OTA: joining WiFi '%s'...\n", ssid);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, pass);
+
+    uint32_t deadline = millis() + 20000UL;   // 20 s to join
+    while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("❌ Gateway OTA: WiFi join failed/timed out");
+        publishOtaAck(false, uid, deviceType, "wifi join failed");
+        WiFi.mode(WIFI_OFF);
+        return;
+    }
+
+    Serial.printf("✅ WiFi joined, IP: %s — starting download from %s\n",
+                  WiFi.localIP().toString().c_str(), url);
+
+    WiFiClientSecure client;
+    client.setInsecure();   // simplest path; swap for a pinned CA if you need stricter verification
+
+    httpUpdate.rebootOnUpdate(true);
+    t_httpUpdate_return result = httpUpdate.update(client, url);
+
+    switch (result) {
+        case HTTP_UPDATE_FAILED:
+            Serial.printf("❌ Gateway OTA failed: %d %s\n",
+                          httpUpdate.getLastError(),
+                          httpUpdate.getLastErrorString().c_str());
+            publishOtaAck(false, uid, deviceType, httpUpdate.getLastErrorString().c_str());
+            break;
+        case HTTP_UPDATE_NO_UPDATES:
+            Serial.println("ℹ️ Gateway OTA: server reported no update needed");
+            publishOtaAck(false, uid, deviceType, "no update available at url");
+            break;
+        case HTTP_UPDATE_OK:
+            // rebootOnUpdate(true) means we never actually reach this line —
+            // the board reboots into the new firmware immediately on success.
+            Serial.println("✅ Gateway OTA applied — rebooting");
+            break;
+    }
+
+    WiFi.mode(WIFI_OFF);
+}
+
 void handleOtaCommand(DynamicJsonDocument& doc) {
     const char* deviceType = doc["device"] | "";
     if (!strlen(deviceType)) {
@@ -648,13 +709,16 @@ void handleOtaCommand(DynamicJsonDocument& doc) {
 
     uint8_t destAddr;
     if (!nodeTypeToAddr(String(deviceType), destAddr)) {
-        // Not a LoRa node — presumably a *gateway* device type. Self-OTA for
-        // this ESP32 (e.g. via HTTPUpdate over the LTE modem) is NOT wired
-        // up in this file; hook it in here once you've picked an HTTPS
-        // download path for A7670-based modems.
-        Serial.printf("ℹ️ OTA target '%s' is a gateway role, not a LoRa node — "
-                      "self-OTA not implemented in this build\n", deviceType);
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "gateway self-OTA not implemented");
+        // Not a LoRa node — this is a gateway-type device targeting itself.
+        const char* url  = doc["url"] | "";
+        const char* ssid = doc["wifi_ssid"] | "";
+        const char* pass = doc["wifi_pass"] | "";
+        if (!strlen(url)) {
+            Serial.println("⚠️ Gateway OTA: missing 'url' field");
+            publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "missing url");
+            return;
+        }
+        selfOtaUpdate(deviceType, doc["UId"] | DEVICE_ID, ssid, pass, url);
         return;
     }
 
@@ -854,7 +918,7 @@ void mqttTask(void* param) {
                 mqttOnline        = false;
                 dState.mqttOnline = false;
                 nextRetry  = now + retryDelay;
-                retryDelay = min(retryDelay * 2, (uint32_t)MQTT_RETRY_MAX_MS);
+                retryDelay = min(retryDelay * 2, MQTT_RETRY_MAX_MS);
             }
             break;
 
