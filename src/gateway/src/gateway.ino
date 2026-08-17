@@ -44,6 +44,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -646,6 +647,18 @@ void publishOtaAck(bool success, const char* deviceId, const char* nodeType, con
 // separately from the LTE modem link, downloads url, and flashes itself.
 // A successful flash reboots the board automatically; the ota_ack is only
 // reachable on failure, since success never returns.
+// -----------------------------------------------------------------------------
+// Modem-based self-OTA: downloads over the SAME GPRS/LTE link already used for
+// MQTT (no WiFi radio involved at all) — sidesteps the WiFi power-spike issue
+// entirely. wifi_ssid/wifi_pass in the OTA payload are ignored in this path;
+// they're kept as parameters only so the function signature matches the
+// -----------------------------------------------------------------------------
+// Self-OTA — joins wifi_ssid/wifi_pass from the OTA payload (a SEPARATE WiFi
+// network from the gateway's own LTE/GPRS link, used only for the duration
+// of the download). Uses ESP32's built-in HTTPUpdate, which follows GitHub's
+// release-asset redirect (github.com -> objects.githubusercontent.com) and
+// retries a few times to smooth over transient connection failures.
+// -----------------------------------------------------------------------------
 void selfOtaUpdate(const char* deviceType, const char* uid,
                    const char* ssid, const char* pass, const char* url) {
     if (!ssid || !strlen(ssid) || !pass || !strlen(pass)) {
@@ -672,17 +685,35 @@ void selfOtaUpdate(const char* deviceType, const char* uid,
 
     Serial.printf("✅ WiFi joined, IP: %s — starting download from %s\n",
                   WiFi.localIP().toString().c_str(), url);
+    Serial.printf("Free heap before OTA: %u bytes\n", ESP.getFreeHeap());
 
-    WiFiClientSecure client;
-    client.setInsecure();   // simplest path; swap for a pinned CA if you need stricter verification
+    const int MAX_ATTEMPTS = 3;
+    t_httpUpdate_return result = HTTP_UPDATE_FAILED;
 
-    httpUpdate.rebootOnUpdate(true);
-    t_httpUpdate_return result = httpUpdate.update(client, url);
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        Serial.printf("Gateway OTA attempt %d/%d...\n", attempt, MAX_ATTEMPTS);
+
+        WiFiClientSecure client;
+        client.setInsecure();   // simplest path; swap for a pinned CA if you need stricter verification
+        client.setTimeout(15000);
+
+        httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);   // GitHub release assets redirect to a different host (S3) — must follow
+        httpUpdate.rebootOnUpdate(true);
+        result = httpUpdate.update(client, url);
+
+        if (result == HTTP_UPDATE_OK) break;   // success — rebootOnUpdate means we won't reach past this anyway
+
+        Serial.printf("  attempt %d failed: %d %s\n", attempt,
+                      httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+        if (attempt < MAX_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(3000));   // brief pause before retrying
+        }
+    }
 
     switch (result) {
         case HTTP_UPDATE_FAILED:
-            Serial.printf("❌ Gateway OTA failed: %d %s\n",
-                          httpUpdate.getLastError(),
+            Serial.printf("❌ Gateway OTA failed after %d attempts: %d %s\n",
+                          MAX_ATTEMPTS, httpUpdate.getLastError(),
                           httpUpdate.getLastErrorString().c_str());
             publishOtaAck(false, uid, deviceType, httpUpdate.getLastErrorString().c_str());
             break;
@@ -918,7 +949,8 @@ void mqttTask(void* param) {
                 mqttOnline        = false;
                 dState.mqttOnline = false;
                 nextRetry  = now + retryDelay;
-                retryDelay = min(retryDelay * 2, (uint32_t)MQTT_RETRY_MAX_MS);            }
+                retryDelay = min(retryDelay * 2, MQTT_RETRY_MAX_MS);
+            }
             break;
 
         case CONNECTED:
