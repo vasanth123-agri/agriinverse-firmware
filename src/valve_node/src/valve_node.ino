@@ -46,8 +46,8 @@
 //  SECTION 2 — NODE IDENTITY  (EDIT THESE PER PHYSICAL NODE)
 // =============================================================================
 
-#define MY_VID   1                                  // 1..15, unique per node
-#define MY_DID   "DId1"                              // human-readable label
+#define MY_VID   2                                  // 1..15, unique per node
+#define MY_DID   "DId2"                              // human-readable label
 #define MY_FID   "cmswv2gnx001342b0b6bj1bwd"         // farm id
 #define MY_BID   "cmswv2i62001742b00omppsyk"         // block id
 #define MY_UID   "66"                                // same across the whole farm
