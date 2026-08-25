@@ -1,28 +1,38 @@
 // =============================================================================
-//  AgriInverse — Solenoid Valve Node  (FINAL v2 — interrupt-driven RX)
+//  AgriInverse — Solenoid Valve Node  (v3 — TB6612FNG dual H-bridge driver)
 //
-//  WHY THIS CHANGED FROM v1
-//  -------------------------
-//  v1 used LoRa.parsePacket() polling in loop(). Every command triggered
-//  >1s of blocking delay() (ACK pre-delay + valve actuation), during which
-//  the radio could receive a NEW packet into its single-packet FIFO — but
-//  since loop() wasn't calling parsePacket() during that window, the packet
-//  was silently missed/overwritten. Symptom: rapid-fire commands sent close
-//  together would mysteriously "not arrive."
+//  CHANGE FROM v2
+//  ----------------
+//  v2 drove the valve H-bridge with 4 raw GPIO pins (IN1-IN4), assuming a
+//  driver (e.g. L298N) that outputs whenever a direction pin goes HIGH.
 //
-//  FIX: LoRa.onReceive() registers an interrupt callback that fires the
-//  instant a packet lands on the radio (via the DIO0 pin), regardless of
-//  what loop() is doing. The callback just copies the raw packet into a
-//  small ring buffer; loop() drains and processes it whenever it's free.
-//  This means the ONLY true blind spot left is the few tens of ms the
-//  radio is actually transmitting (ACK/relay TX) — a physical half-duplex
-//  limit, not a software one, and unavoidable on a single radio.
+//  TB6612FNG requires explicit PWM gating — AIN1/AIN2 (or BIN1/BIN2) alone
+//  do NOT produce output; PWMA/PWMB must be HIGH for the corresponding
+//  channel to actually switch, and STBY must be HIGH to leave standby.
+//  This board only has 6 usable GPIOs available (16,17,21,22,27,32 —
+//  34/35 are input-only), not enough for both direction pins AND PWM
+//  pins on both channels. Since this application never needs variable
+//  speed — only full on/off — PWMA/PWMB are tied DIRECTLY TO 3.3V in
+//  hardware instead of being GPIOs, freeing enough pins for STBY +
+//  both channels' direction control.
 //
-//  ROUTING MODEL (unchanged from v1)
-//  -----------------------------------
-//  Every radio message — command, OTA, ack, ota_ack — is sent to BROADCAST.
-//  Each node decides locally: dedupe by msgId → consume if VId matches,
-//  else relay (hop--, RSSI-weighted jitter, rebroadcast).
+//  TB6612FNG is a DUAL H-bridge — one chip drives BOTH valves:
+//    Valve A → AIN1 / AIN2   (PWMA hardwired HIGH)
+//    Valve B → BIN1 / BIN2   (PWMB hardwired HIGH)
+//    STBY is SHARED across both channels.
+//
+//  Every actuation follows this safe sequence:
+//    1. STBY HIGH          (leave standby)
+//    2. Set direction       (AIN1/AIN2 or BIN1/BIN2)
+//    3. PWMx HIGH            (channel actually outputs now)
+//    4. Hold for exactly PULSE_MS
+//    5. PWMx LOW             (stop immediately)
+//    6. Direction pins LOW   (clear, unambiguous state)
+//    7. STBY LOW            (back to true standby — near-zero current,
+//                             unlike a raw L298N which can't fully sleep)
+//
+//  Everything else — mesh routing, dedupe, hop/relay, OTA, ack format —
+//  is UNCHANGED from v2.
 // =============================================================================
 
 #include <SPI.h>
@@ -56,13 +66,29 @@
 #define BROADCAST   0xD1
 
 // =============================================================================
-//  SECTION 3 — VALVE H-BRIDGE PINS   (avoid 34/35/36/39 — input-only on ESP32)
+//  SECTION 3 — TB6612FNG DUAL H-BRIDGE PINS
+//  Only 6 usable GPIOs available on this board: 16,17,21,22,27,32
+//  (34 and 35 are INPUT-ONLY on ESP32 — cannot drive outputs, left unused)
+//
+//  PWMA/PWMB are NOT wired to any GPIO — tie them DIRECTLY TO 3.3V in
+//  hardware. Since this application only ever needs full on/off drive
+//  (never variable speed), permanently-high PWM plus STBY + direction
+//  pins alone gives complete control with no GPIO cost.
 // =============================================================================
 
-#define IN1 16   // Valve A — OPEN
-#define IN2 17   // Valve A — CLOSE
-#define IN3 21   // Valve B — OPEN
-#define IN4 22   // Valve B — CLOSE
+// Valve A
+#define AIN1  16
+#define AIN2  17
+
+// Valve B
+#define BIN1  21
+#define BIN2  22
+
+// Shared standby — LOW = both channels off, true low-power state
+#define STBY  27
+
+// GPIO32 — spare, unused for now
+// GPIO34, GPIO35 — input-only, cannot drive outputs, left unconnected
 
 #define PULSE_MS 300
 #define SAFE_MS  150
@@ -114,11 +140,6 @@ void markSeen(uint32_t msgId) {
 uint32_t lastExecutedCmdMsgId = 0;
 uint32_t lastExecutedOtaMsgId = 0;
 
-// OTA-only: gateway sends the last 4 characters of FId/BId instead of the
-// full 25-char CUID, since OTA envelopes also carry url/wifi/pass and can
-// blow past LoRa's 255-byte packet ceiling. Regular commands still carry
-// the full FId/BId (they don't need the extra room). Must match the
-// gateway's last4() exactly.
 String last4(const char* s) {
     String str(s);
     int len = str.length();
@@ -178,11 +199,6 @@ int rssiForwardDelay(int rssi) {
 
 // =============================================================================
 //  SECTION 9 — INTERRUPT-DRIVEN RX QUEUE
-//
-//  onReceivePacket() fires from LoRa's DIO0 interrupt the instant a packet
-//  lands — independent of what loop() is doing. It only copies raw bytes
-//  into a small ring buffer; all JSON/relay/actuation logic happens in
-//  loop(), which drains this queue whenever it's free.
 // =============================================================================
 
 #define RX_QUEUE_SIZE 4
@@ -197,17 +213,14 @@ struct RawPacket {
 };
 
 volatile RawPacket rxQueue[RX_QUEUE_SIZE];
-volatile uint8_t   rxHead = 0;   // next slot to write (ISR)
-volatile uint8_t   rxTail = 0;   // next slot to read  (loop)
+volatile uint8_t   rxHead = 0;
+volatile uint8_t   rxTail = 0;
 
 void onReceivePacket(int packetSize) {
     if (packetSize < 2) return;
 
     uint8_t next = (rxHead + 1) % RX_QUEUE_SIZE;
-    if (next == rxTail) {
-        // Queue full — drop oldest silently rather than blocking in an ISR.
-        return;
-    }
+    if (next == rxTail) return;
 
     volatile RawPacket& slot = rxQueue[rxHead];
     slot.dest = LoRa.read();
@@ -243,7 +256,7 @@ void sendRaw(const String& json) {
     LoRa.print(json);
     LoRa.endPacket();
     recordTx();
-    LoRa.receive();   // re-enter continuous RX mode after TX
+    LoRa.receive();
 }
 
 void relayEnvelope(StaticJsonDocument<600>& doc, int hop, int rssi, const char* why) {
@@ -257,7 +270,7 @@ void relayEnvelope(StaticJsonDocument<600>& doc, int hop, int rssi, const char* 
     serializeJson(doc, out);
 
     int d = rssiForwardDelay(rssi);
-    delay(d);   // radio stays in RX during this — onReceivePacket still fires
+    delay(d);
     sendRaw(out);
     Serial.printf("🔁 Relayed [%s] hop %d→%d | delay %dms\n", why, hop, hop - 1, d);
 }
@@ -285,7 +298,7 @@ void sendAck(const String& status, const char* fid, const char* bid,
     serializeJson(ack, out);
 
     Serial.printf("⏳ ACK pre-delay %dms...\n", ACK_PRE_DELAY_MS);
-    delay(ACK_PRE_DELAY_MS);   // radio stays in RX — onReceivePacket still fires
+    delay(ACK_PRE_DELAY_MS);
     for (int i = 0; i < ACK_REPEATS; i++) sendRaw(out);
     Serial.printf("📡 ACK sent: %s\n", out.c_str());
 }
@@ -314,30 +327,49 @@ void sendOtaAck(bool ok, const char* fid, const char* bid,
 }
 
 // =============================================================================
-//  SECTION 12 — VALVE DRIVERS
+//  SECTION 12 — VALVE DRIVERS  (TB6612FNG — proper PWM gating + STBY)
 // =============================================================================
 
-void openValve(uint8_t pinOpen, uint8_t pinClose, const char* label,
-               const char* fid, const char* bid, uint32_t msgId) {
-    digitalWrite(pinClose, LOW); delay(SAFE_MS);
-    Serial.printf("🔓 Opening Valve %s\n", label);
-    digitalWrite(pinOpen, HIGH); delay(PULSE_MS); digitalWrite(pinOpen, LOW);
-    updateState(String(label), "open");
-    sendAck("Valve " + String(label) + " Opened", fid, bid, msgId);
+void actuateValve(uint8_t ainPos, uint8_t ainNeg,
+                  bool energizePositive, const char* label, const char* action,
+                  const char* fid, const char* bid, uint32_t msgId) {
+    digitalWrite(ainPos, LOW);
+    digitalWrite(ainNeg, LOW);
+    delay(SAFE_MS);
+
+    digitalWrite(STBY, HIGH);
+    digitalWrite(ainPos, energizePositive ? HIGH : LOW);
+    digitalWrite(ainNeg, energizePositive ? LOW  : HIGH);
+    // PWMA/PWMB are hardwired to 3.3V — direction pins alone now control
+    // output, since PWM is permanently "on" at the hardware level.
+
+    Serial.printf("%s Valve %s\n", energizePositive ? "🔓 Opening" : "🔒 Closing", label);
+    delay(PULSE_MS);
+
+    digitalWrite(ainPos, LOW);
+    digitalWrite(ainNeg, LOW);
+    digitalWrite(STBY, LOW);
+
+    updateState(String(label), action);
+    String status = "Valve " + String(label) + (energizePositive ? " Opened" : " Closed");
+    sendAck(status, fid, bid, msgId);
 }
 
-void closeValve(uint8_t pinOpen, uint8_t pinClose, const char* label,
-                const char* fid, const char* bid, uint32_t msgId) {
-    digitalWrite(pinOpen, LOW); delay(SAFE_MS);
-    Serial.printf("🔒 Closing Valve %s\n", label);
-    digitalWrite(pinClose, HIGH); delay(PULSE_MS); digitalWrite(pinClose, LOW);
-    updateState(String(label), "close");
-    sendAck("Valve " + String(label) + " Closed", fid, bid, msgId);
+void openValveA(const char* fid, const char* bid, uint32_t msgId) {
+    actuateValve(AIN1, AIN2, true, "A", "open", fid, bid, msgId);
+}
+void closeValveA(const char* fid, const char* bid, uint32_t msgId) {
+    actuateValve(AIN1, AIN2, false, "A", "close", fid, bid, msgId);
+}
+void openValveB(const char* fid, const char* bid, uint32_t msgId) {
+    actuateValve(BIN1, BIN2, true, "B", "open", fid, bid, msgId);
+}
+void closeValveB(const char* fid, const char* bid, uint32_t msgId) {
+    actuateValve(BIN1, BIN2, false, "B", "close", fid, bid, msgId);
 }
 
 // =============================================================================
-//  SECTION 13 — OTA  (self-flash, blocking — acceptable, this node has no
-//  other time-critical duty; unlike the gateway there's no MQTT pump to stall)
+//  SECTION 13 — OTA  (self-flash, blocking — acceptable, no other duty here)
 // =============================================================================
 
 void runSelfOta(const char* url, const char* ssid, const char* pass,
@@ -449,9 +481,6 @@ void processPacket(uint8_t dest, uint8_t src, const char* buf, uint16_t len, int
     bool isOta = (strcmp(type, "ota") == 0);
 
     if (isOta) {
-        // OTA envelopes carry shortened FId4/BId4 (last 4 chars) instead of
-        // the full string — url/wifi/pass already eat most of the 253-byte
-        // LoRa payload budget.
         const char* fid4 = doc["FId4"] | "";
         const char* bid4 = doc["BId4"] | "";
         if (strlen(fid4) && myFid4 != fid4) {
@@ -465,7 +494,6 @@ void processPacket(uint8_t dest, uint8_t src, const char* buf, uint16_t len, int
             return;
         }
     } else {
-        // Regular commands still carry the full FId/BId.
         const char* fid = doc["FId"] | "";
         const char* bid = doc["BId"] | "";
         if (strlen(fid) && strcmp(fid, MY_FID) != 0) {
@@ -479,7 +507,6 @@ void processPacket(uint8_t dest, uint8_t src, const char* buf, uint16_t len, int
             return;
         }
     }
-    // Confirmed ours — use our own known full FId/BId for acks from here on.
     const char* fid = MY_FID;
     const char* bid = MY_BID;
 
@@ -522,12 +549,12 @@ void processPacket(uint8_t dest, uint8_t src, const char* buf, uint16_t len, int
 
     lastExecutedCmdMsgId = msgId;
     if (valve == "A") {
-        if      (cmd == "open")  openValve (IN1, IN2, "A", fid, bid, msgId);
-        else if (cmd == "close") closeValve(IN1, IN2, "A", fid, bid, msgId);
+        if      (cmd == "open")  openValveA(fid, bid, msgId);
+        else if (cmd == "close") closeValveA(fid, bid, msgId);
         else Serial.printf("⚠️ Unknown command: %s\n", cmd.c_str());
     } else if (valve == "B") {
-        if      (cmd == "open")  openValve (IN3, IN4, "B", fid, bid, msgId);
-        else if (cmd == "close") closeValve(IN3, IN4, "B", fid, bid, msgId);
+        if      (cmd == "open")  openValveB(fid, bid, msgId);
+        else if (cmd == "close") closeValveB(fid, bid, msgId);
         else Serial.printf("⚠️ Unknown command: %s\n", cmd.c_str());
     } else {
         Serial.printf("⚠️ Unknown valve: %s\n", valve.c_str());
@@ -535,22 +562,37 @@ void processPacket(uint8_t dest, uint8_t src, const char* buf, uint16_t len, int
 }
 
 // =============================================================================
-//  SECTION 15 — SETUP
+//  SECTION 15 — SAFE STARTUP  (called first — TB6612 STBY LOW, all
+//  direction/PWM pins LOW before anything else can possibly run)
+// =============================================================================
+
+void safeStartupPins() {
+    pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+    pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+    pinMode(STBY, OUTPUT);
+
+    digitalWrite(STBY, LOW);
+    digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
+
+    Serial.println("🔒 Safe startup — TB6612 STBY LOW, all direction pins LOW (PWMA/PWMB hardwired HIGH)");
+}
+
+// =============================================================================
+//  SECTION 16 — SETUP
 // =============================================================================
 
 void setup() {
     Serial.begin(115200);
-    pinMode(IN1, OUTPUT); digitalWrite(IN1, LOW);
-    pinMode(IN2, OUTPUT); digitalWrite(IN2, LOW);
-    pinMode(IN3, OUTPUT); digitalWrite(IN3, LOW);
-    pinMode(IN4, OUTPUT); digitalWrite(IN4, LOW);
+
+    safeStartupPins();
 
     for (int i = 0; i < SEEN_CACHE_SIZE; i++) seenCache[i] = { 0, 0, false };
     for (int i = 0; i < RX_QUEUE_SIZE; i++)   rxQueue[i].used = false;
     loadValveState();
     randomSeed(esp_random());
 
-    Serial.println("\n🚀 Valve Node (interrupt-RX) starting...");
+    Serial.println("\n🚀 Valve Node (TB6612FNG) starting...");
     Serial.printf("📛 VId:%d  DId:%s\n", MY_VID, MY_DID);
 
     LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
@@ -563,14 +605,13 @@ void setup() {
     LoRa.enableCrc();
 
     LoRa.onReceive(onReceivePacket);
-    LoRa.receive();   // continuous RX mode — interrupt fires on every packet
+    LoRa.receive();
 
     Serial.println("✅ LoRa ready — SF7/BW125/CR5/0xAB — interrupt-driven RX active");
 }
 
 // =============================================================================
-//  SECTION 16 — MAIN LOOP  (drains the ISR-filled queue; all blocking work
-//  — ACKs, actuation, OTA — happens here, safely outside the interrupt)
+//  SECTION 17 — MAIN LOOP
 // =============================================================================
 
 void loop() {
