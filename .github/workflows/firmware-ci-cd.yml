@@ -2,9 +2,9 @@ name: Firmware CI/CD
 on:
   push:
     branches: [ main ]
-       tags:
-     - '*-v*'
-     - 'v*'
+    tags:
+      - '*-v*'
+      - 'v*'
   pull_request:
     branches: [ main ]
   workflow_dispatch: {}
@@ -125,7 +125,6 @@ jobs:
           printf '%s' "$ROOT_CA" > src/sensor_gateway/src/root_ca.h
           printf '%s' "$CERTIFICATE" > src/sensor_gateway/src/certificate.h
           printf '%s' "$PRIVATE_KEY" > src/sensor_gateway/src/privatekey.h
-          
       - name: Build sensor gateway firmware
         working-directory: src/sensor_gateway
         run: pio run -e esp32dev
