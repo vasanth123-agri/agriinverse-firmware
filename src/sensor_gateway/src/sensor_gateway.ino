@@ -54,7 +54,6 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-#include "awscerts.h"
 #include "certificate.h"
 #include "privatekey.h"
 #include "root_ca.h"
@@ -76,6 +75,18 @@ const char client_id[]         = DEVICE_ID;
 #define GATEWAY_ID   0xBB
 #define NODE1_ID     0xAA
 #define NODE2_ID     0xCC
+
+// ======================== NETWORK & BROKER =======================
+// ⚠️ EDIT these for your actual SIM/APN and AWS IoT endpoint before flashing.
+const char apn[]      = "iot.com";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+const char broker[]              = "a2nvakoqnh614u-ats.iot.us-east-1.amazonaws.com";
+const int  broker_port           = 8883;
+
+const char subscribe_topic[]     = "device/cmd";
+const char publish_topic[]       = "device/data";
 
 // ======================== LoRa RF ===============================
 #define LORA_SF        7
