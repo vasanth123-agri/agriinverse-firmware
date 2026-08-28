@@ -124,7 +124,7 @@ jobs:
           printf '%s' "$ROOT_CA" > src/sensor_gateway/src/root_ca.h
           printf '%s' "$CERTIFICATE" > src/sensor_gateway/src/certificate.h
           printf '%s' "$PRIVATE_KEY" > src/sensor_gateway/src/privatekey.h
-          printf '%s' "$ROOT_CA" > src/sensor_gateway/src/awscerts.h
+          
       - name: Build sensor gateway firmware
         working-directory: src/sensor_gateway
         run: pio run -e esp32dev
