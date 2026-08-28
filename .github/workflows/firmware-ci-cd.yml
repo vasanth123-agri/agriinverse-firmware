@@ -1,5 +1,4 @@
 name: Firmware CI/CD
-
 on:
   push:
     branches: [ main ]
@@ -8,19 +7,16 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch: {}
-
 jobs:
   build-gateway:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python (for PlatformIO)
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Cache PlatformIO
         uses: actions/cache@v4
         with:
@@ -28,10 +24,8 @@ jobs:
             ~/.platformio
             src/gateway/.pio
           key: pio-gateway-${{ runner.os }}-${{ hashFiles('src/gateway/platformio.ini') }}
-
       - name: Install PlatformIO
         run: pip install -U platformio
-
       - name: Inject AWS IoT credentials
         env:
           ROOT_CA: ${{ secrets.AWS_ROOT_CA_H }}
@@ -41,24 +35,20 @@ jobs:
           printf '%s' "$ROOT_CA" > src/gateway/src/root_ca.h
           printf '%s' "$CERTIFICATE" > src/gateway/src/certificate.h
           printf '%s' "$PRIVATE_KEY" > src/gateway/src/privatekey.h
-
       - name: Build gateway firmware
         working-directory: src/gateway
         run: pio run -e esp32dev
-
       - name: Rename artifact with version tag
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir -p dist
           cp src/gateway/.pio/build/esp32dev/firmware.bin "dist/gateway-${GITHUB_REF_NAME}.bin"
-
       - name: Upload gateway artifact (every run)
         uses: actions/upload-artifact@v4
         with:
           name: gateway-firmware-${{ github.sha }}
           path: src/gateway/.pio/build/esp32dev/firmware.bin
           retention-days: 14
-
       - name: Create GitHub Release with gateway firmware
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -67,18 +57,15 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   build-valve-node:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python (for PlatformIO)
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Cache PlatformIO
         uses: actions/cache@v4
         with:
@@ -86,32 +73,77 @@ jobs:
             ~/.platformio
             src/valve_node/.pio
           key: pio-valve-${{ runner.os }}-${{ hashFiles('src/valve_node/platformio.ini') }}
-
       - name: Install PlatformIO
         run: pip install -U platformio
-
       - name: Build valve node firmware
         working-directory: src/valve_node
         run: pio run -e esp32dev
-
       - name: Rename artifact with version tag
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir -p dist
           cp src/valve_node/.pio/build/esp32dev/firmware.bin "dist/valve_node-${GITHUB_REF_NAME}.bin"
-
       - name: Upload valve node artifact (every run)
         uses: actions/upload-artifact@v4
         with:
           name: valve-node-firmware-${{ github.sha }}
           path: src/valve_node/.pio/build/esp32dev/firmware.bin
           retention-days: 14
-
       - name: Create GitHub Release with valve node firmware
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/valve_node-*.bin
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  build-sensor-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python (for PlatformIO)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            src/sensor_gateway/.pio
+          key: pio-sensor-gateway-${{ runner.os }}-${{ hashFiles('src/sensor_gateway/platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install -U platformio
+      - name: Inject AWS IoT credentials
+        env:
+          ROOT_CA: ${{ secrets.AWS_ROOT_CA_H }}
+          CERTIFICATE: ${{ secrets.AWS_CERTIFICATE_H }}
+          PRIVATE_KEY: ${{ secrets.AWS_PRIVATE_KEY_H }}
+        run: |
+          printf '%s' "$ROOT_CA" > src/sensor_gateway/src/root_ca.h
+          printf '%s' "$CERTIFICATE" > src/sensor_gateway/src/certificate.h
+          printf '%s' "$PRIVATE_KEY" > src/sensor_gateway/src/privatekey.h
+          printf '%s' "$ROOT_CA" > src/sensor_gateway/src/awscerts.h
+      - name: Build sensor gateway firmware
+        working-directory: src/sensor_gateway
+        run: pio run -e esp32dev
+      - name: Rename artifact with version tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p dist
+          cp src/sensor_gateway/.pio/build/esp32dev/firmware.bin "dist/sensor_gateway-${GITHUB_REF_NAME}.bin"
+      - name: Upload sensor gateway artifact (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sensor-gateway-firmware-${{ github.sha }}
+          path: src/sensor_gateway/.pio/build/esp32dev/firmware.bin
+          retention-days: 14
+      - name: Create GitHub Release with sensor gateway firmware
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/sensor_gateway-*.bin
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
