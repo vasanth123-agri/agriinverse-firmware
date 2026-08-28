@@ -54,7 +54,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-#include "awscerts.h"
+
 #include "certificate.h"
 #include "privatekey.h"
 #include "root_ca.h"
