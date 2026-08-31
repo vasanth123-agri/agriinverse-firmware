@@ -187,3 +187,92 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  build-fertigation-node:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python (for PlatformIO)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            src/fertigation_node/.pio
+          key: pio-fertigation-node-${{ runner.os }}-${{ hashFiles('src/fertigation_node/platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install -U platformio
+      - name: Build fertigation node firmware
+        working-directory: src/fertigation_node
+        run: pio run -e esp32dev
+      - name: Rename artifact with version tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p dist
+          cp src/fertigation_node/.pio/build/esp32dev/firmware.bin "dist/fertigation_node-${GITHUB_REF_NAME}.bin"
+      - name: Upload fertigation node artifact (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fertigation-node-firmware-${{ github.sha }}
+          path: src/fertigation_node/.pio/build/esp32dev/firmware.bin
+          retention-days: 14
+      - name: Create GitHub Release with fertigation node firmware
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/fertigation_node-*.bin
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  build-fertigation-gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python (for PlatformIO)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            src/fertigation_gateway/.pio
+          key: pio-fertigation-gateway-${{ runner.os }}-${{ hashFiles('src/fertigation_gateway/platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install -U platformio
+      - name: Inject AWS IoT credentials
+        env:
+          ROOT_CA: ${{ secrets.AWS_ROOT_CA_H }}
+          CERTIFICATE: ${{ secrets.AWS_CERTIFICATE_H }}
+          PRIVATE_KEY: ${{ secrets.AWS_PRIVATE_KEY_H }}
+        run: |
+          printf '%s' "$ROOT_CA" > src/fertigation_gateway/src/root_ca.h
+          printf '%s' "$CERTIFICATE" > src/fertigation_gateway/src/certificate.h
+          printf '%s' "$PRIVATE_KEY" > src/fertigation_gateway/src/privatekey.h
+      - name: Build fertigation gateway firmware
+        working-directory: src/fertigation_gateway
+        run: pio run -e esp32dev
+      - name: Rename artifact with version tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p dist
+          cp src/fertigation_gateway/.pio/build/esp32dev/firmware.bin "dist/fertigation_gateway-${GITHUB_REF_NAME}.bin"
+      - name: Upload fertigation gateway artifact (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fertigation-gateway-firmware-${{ github.sha }}
+          path: src/fertigation_gateway/.pio/build/esp32dev/firmware.bin
+          retention-days: 14
+      - name: Create GitHub Release with fertigation gateway firmware
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/fertigation_gateway-*.bin
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
