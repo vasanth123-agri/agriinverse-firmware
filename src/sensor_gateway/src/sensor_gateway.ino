@@ -1,5 +1,6 @@
 /* ================================================================
    Dual-Node Sensor Gateway  (Node1 0xAA + Node2 0xCC)  — with OTA
+                                        + INA219 battery telemetry
    GSM (A7670) + AWS IoT MQTT + LoRa 433 MHz SF7 BW125
    0.96" SSD1306 OLED status display (128×64, I2C 0x3C)
    ----------------------------------------------------------------
@@ -13,17 +14,45 @@
                                   OTA can never stall modem.mqtt_handle()
    ----------------------------------------------------------------
    OTA/mode payload (self-OTA — targets this gateway):
-     { "UId":"51", "device":"sensor gateway",
+     { "UId":"76", "device":"sensor gateway",
        "wifi_ssid":"...", "wifi_pass":"...", "url":"..." }
 
    OTA/mode payload (relay to a LoRa node — targets Node1 or Node2):
-     { "UId":"51", "device":"sensor node", "NodeNum":1,
+     { "UId":"76", "device":"sensor node", "NodeNum":1,
        "wifi_ssid":"...", "wifi_pass":"...", "url":"..." }
    NodeNum 1 -> NODE1_ID (0xAA), NodeNum 2 -> NODE2_ID (0xCC).
    Node firmware must reply with {"type":"ota_ack","status":"ok"/"fail"}
-   addressed back to GATEWAY_ID, matching this gateway's existing
-   direct-addressing model (not the mesh/broadcast model used by the
-   valve+motor gateway's nodes).
+   addressed back to GATEWAY_ID.
+   ----------------------------------------------------------------
+   NODE2 BATTERY / RAW-VOLTAGE ADDITIONS
+   -------------------------------------
+   Node2's firmware now sends six extra keys:
+     "SoilV"  raw soil-probe pin voltage      (V, diagnostic)
+     "TDSV"   raw TDS-probe pin voltage       (V, diagnostic)
+     "VB"     battery bus voltage             (V)
+     "IB"     battery current                 (mA)
+     "BP"     rough state-of-charge           (%, -1 = unknown)
+     "CHG"    charge state                    (1 chg, -1 dischg,
+                                                0 idle/full,
+                                               -2 INA219 offline)
+
+   IB sign convention (matches the node firmware and the LiFePO4
+   SoC tracker):  IB > 0 = DISCHARGING, IB < 0 = CHARGING.
+   CHG is independent of that sign and always uses 1 = charging.
+
+   The pack is single-cell LiFePO4, whose discharge curve is nearly
+   flat from ~20-90% SoC, so BP is a coarse hint only. VB and IB are
+   the fields worth trending in the cloud.
+
+   BUFFER SIZES — DO NOT SHRINK THESE BACK
+   ---------------------------------------
+   Six extra fields pushed the outgoing JSON past the old 512-byte
+   payload buffers. MqttPubReq.payload, pendingBuf and the local
+   build buffers are now 768. The RX parse document went 512 -> 1024
+   because Node2's packet now carries ~28 keys, and the publish
+   document 1024 -> 1536. serializeJson() truncates silently when the
+   buffer is short, so an undersized buffer shows up as malformed
+   JSON at AWS rather than as an error here.
    ----------------------------------------------------------------
    Dependencies (Library Manager / platformio.ini):
      adafruit/Adafruit SSD1306 @ ^2.5.7
@@ -112,6 +141,13 @@ const char publish_topic[]       = "device/data";
 #define RX_QUEUE_DEPTH        8
 #define MQTT_PUB_QUEUE_DEPTH  8
 
+// ======================== BUFFER SIZES ==========================
+// Sized for the full Node2 payload including SoilV/TDSV/VB/IB/BP/CHG
+// plus the nested Node1 object. See header note before changing.
+#define PUB_PAYLOAD_SIZE     768
+#define RX_JSON_DOC_SIZE    1024
+#define PUB_JSON_DOC_SIZE   1536
+
 // ======================== OLED CONFIG ===========================
 #define OLED_W         128
 #define OLED_H         64
@@ -120,7 +156,8 @@ const char publish_topic[]       = "device/data";
 #define OLED_ROW0_Y    0
 #define OLED_ROW1_Y    18
 #define OLED_ROW2_Y    30
-#define OLED_ROW3_Y    48
+#define OLED_ROW3_Y    46
+#define OLED_ROW4_Y    56   // Battery row (last 8 px: 56-63)
 
 // ======================== STRUCTS ===============================
 struct LoRaRxPacket {
@@ -133,7 +170,7 @@ struct LoRaRxPacket {
 };
 
 struct MqttPubReq {
-    char payload[512];
+    char payload[PUB_PAYLOAD_SIZE];
 };
 
 // OTA state for whichever LoRa node is currently being updated.
@@ -182,7 +219,7 @@ static volatile bool  node1Received = false;
 static volatile bool  node2Received = false;
 static volatile bool  idleSent      = false;
 
-static char pendingBuf[512] = {};
+static char pendingBuf[PUB_PAYLOAD_SIZE] = {};
 static bool pendingData     = false;
 
 static volatile unsigned long lastNode1      = 0;
@@ -203,6 +240,17 @@ static float n2_F1=0,  n2_F2=0,  n2_F3=0,  n2_F4=0;
 static float n2_F5=0,  n2_F6=0,  n2_F7=0,  n2_F8=0;
 static float n2_NIR=0, n2_Clear=0;
 
+// Node2 raw probe voltages (diagnostic — lets you re-derive or
+// sanity-check SM/TDS in the cloud without reflashing the node)
+static float n2_SoilV = 0;
+static float n2_TDSV  = 0;
+
+// Node2 battery (INA219)
+static float n2_VB  = 0;    // bus voltage, V
+static float n2_IB  = 0;    // current, mA  (+ = discharging)
+static int   n2_BP  = -1;   // rough SoC %, -1 = unknown
+static int   n2_CHG = -2;   // 1 chg, -1 dischg, 0 idle/full, -2 offline
+
 // ======================== DIAGNOSTICS ===========================
 static uint32_t diagRxTotal=0,    diagRxBad=0;
 static uint32_t diagPubOk=0,      diagPubFail=0;
@@ -217,6 +265,16 @@ bool isNode2Sending() { return node2Received && (millis()-lastNode2 <= SEND_TIME
 bool isNode1Active()  { return node1Received && (millis()-lastNode1 <= IDLE_TIMEOUT); }
 bool isNode2Active()  { return node2Received && (millis()-lastNode2 <= IDLE_TIMEOUT); }
 bool eitherActive()   { return isNode1Active() || isNode2Active(); }
+
+// Short label for the OLED battery row / serial diagnostics.
+static const char* chgLabel(int chg) {
+    switch (chg) {
+        case  1: return "CHG";
+        case -1: return "DIS";
+        case  0: return "IDL";
+        default: return "N/A";   // -2 = INA219 not responding on the node
+    }
+}
 
 // ================================================================
 //  OLED — internal helpers
@@ -296,6 +354,24 @@ static void oledRefresh() {
         oledFmtAgo(tmp, sizeof(tmp), cloudSec);
         oled.print(tmp);
     }
+
+    // ---- Node2 battery row ----
+    // Blank until Node2 has actually reported; showing 0.00V before
+    // the first packet reads as a dead cell rather than "no data".
+    oled.setCursor(0, OLED_ROW4_Y);
+    if (!node2Received) {
+        oled.print("B:--");
+    } else if (n2_CHG == -2) {
+        oled.print("B:INA219 offline");
+    } else if (n2_BP >= 0) {
+        snprintf(tmp, sizeof(tmp), "B:%.2fV %d%% %s",
+                 n2_VB, n2_BP, chgLabel(n2_CHG));
+        oled.print(tmp);
+    } else {
+        snprintf(tmp, sizeof(tmp), "B:%.2fV %s", n2_VB, chgLabel(n2_CHG));
+        oled.print(tmp);
+    }
+
     oled.display();
 }
 
@@ -317,11 +393,11 @@ static void flushCmqttPub() {
 //  BUILD DATA / IDLE JSON
 // ================================================================
 static uint16_t buildDataJson(char* out, size_t outSize) {
-    DynamicJsonDocument doc(1024);
-    doc["FId"] = "cmtbikepa03ihoe01xj2j6zgn";
+    DynamicJsonDocument doc(PUB_JSON_DOC_SIZE);
+    doc["FId"] = "cmt6xup2a000142w245th8glj";
     doc["Id"]  = "M1";
     doc["UId"] = DEVICE_ID;
-    doc["BId"] = "cmtbikfry03iloe0172em7k2t";
+    doc["BId"] = "cmt6xuqgx000542w23rst3vo2";
     doc["DId"] = "D1";
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -334,6 +410,19 @@ static uint16_t buildDataJson(char* out, size_t outSize) {
         doc["F5"]=n2ok?n2_F5:0; doc["F6"]=n2ok?n2_F6:0; doc["F7"]=n2ok?n2_F7:0; doc["F8"]=n2ok?n2_F8:0;
         doc["NIR"]=n2ok?n2_NIR:0; doc["Clear"]=n2ok?n2_Clear:0;
 
+        // Raw probe voltages — diagnostic
+        doc["SoilV"] = n2ok ? n2_SoilV : 0;
+        doc["TDSV"]  = n2ok ? n2_TDSV  : 0;
+
+        // Battery (INA219). When Node2 is stale these go to a
+        // clearly-invalid marker rather than 0, so the cloud can tell
+        // "no recent data" apart from "cell is flat at 0V".
+        JsonObject bat = doc.createNestedObject("Bat");
+        bat["VB"]  = n2ok ? n2_VB  : 0;
+        bat["IB"]  = n2ok ? n2_IB  : 0;
+        bat["BP"]  = n2ok ? n2_BP  : -1;
+        bat["CHG"] = n2ok ? n2_CHG : -2;
+
         bool n1ok = isNode1Active();
         JsonObject n1o = doc.createNestedObject("Node1");
         n1o["N"]=n1ok?n1_N:0; n1o["P"]=n1ok?n1_P:0; n1o["K"]=n1ok?n1_K:0;
@@ -341,7 +430,16 @@ static uint16_t buildDataJson(char* out, size_t outSize) {
 
         xSemaphoreGive(dataMutex);
     }
-    return (uint16_t)serializeJson(doc, out, outSize);
+
+    size_t n = serializeJson(doc, out, outSize);
+
+    // serializeJson() truncates silently on overflow — catch it here
+    // rather than letting malformed JSON reach AWS.
+    if (doc.overflowed() || n >= outSize - 1) {
+        Serial.printf("[!] Publish JSON near/over buffer: %u of %u bytes\n",
+                      (unsigned)n, (unsigned)outSize);
+    }
+    return (uint16_t)n;
 }
 
 static uint16_t buildIdleJson(char* out, size_t outSize) {
@@ -815,7 +913,7 @@ void appTask(void* param) {
             }
             if (js > 0) payload = payload.substring(js);
 
-            DynamicJsonDocument tmp(512);
+            DynamicJsonDocument tmp(RX_JSON_DOC_SIZE);
             if (deserializeJson(tmp, payload) != DeserializationError::Ok) {
                 diagRxBad++;
                 Serial.printf("[X] JSON parse fail 0x%02X\n", pkt.src);
@@ -880,12 +978,31 @@ void appTask(void* param) {
                     n2_F8    = tmp["F8"]   | 0.0f;
                     n2_NIR   = tmp["NIR"]  | 0.0f;
                     n2_Clear = tmp["Clear"]| 0.0f;
+
+                    // Raw probe voltages — kept unclamped on purpose.
+                    // These are the diagnostic view; SM/EC above are
+                    // the clamped, calibrated view.
+                    n2_SoilV = tmp["SoilV"] | 0.0f;
+                    n2_TDSV  = tmp["TDSV"]  | 0.0f;
+
+                    // Battery (INA219). Defaults chosen so an older
+                    // node that doesn't send these keys reports
+                    // "unknown" rather than a plausible-looking 0.
+                    n2_VB    = tmp["VB"]  | 0.0f;
+                    n2_IB    = tmp["IB"]  | 0.0f;
+                    n2_BP    = tmp["BP"]  | -1;
+                    n2_CHG   = tmp["CHG"] | -2;
+
                     node2Received = true;
                     lastNode2     = millis();
                     idleSent      = false;
                     parsed        = true;
                     Serial.printf("Node2 -> CO2=%.0f par=%.1f CT=%.1f CH=%.1f ST=%.1f SM=%.0f TDS->EC=%.1f Ph=%.1f\n",
                                   n2_CO2, n2_par, n2_CT, n2_CH, n2_ST, n2_SM, n2_EC, n2_Ph);
+                    Serial.printf("         SoilV=%.3fV TDSV=%.3fV\n",
+                                  n2_SoilV, n2_TDSV);
+                    Serial.printf("         Batt VB=%.3fV IB=%+.1fmA BP=%d%% %s\n",
+                                  n2_VB, n2_IB, n2_BP, chgLabel(n2_CHG));
 
                 } else {
                     Serial.printf("[skip] Unknown 0x%02X\n", pkt.src);
@@ -897,7 +1014,7 @@ void appTask(void* param) {
             }
 
             if (parsed) {
-                char buf[512];
+                char buf[PUB_PAYLOAD_SIZE];
                 buildDataJson(buf, sizeof(buf));
                 if (mqttOnline) {
                     enqueuePublish(buf);
@@ -955,6 +1072,8 @@ void appTask(void* param) {
             Serial.printf("  Idle sent:     %lu\n",  diagIdleSent);
             Serial.printf("  Node1 active:  %s\n",   isNode1Active()?"YES":"NO");
             Serial.printf("  Node2 active:  %s\n",   isNode2Active()?"YES":"NO");
+            Serial.printf("  N2 battery:    %.3fV %+.1fmA %s\n",
+                          n2_VB, n2_IB, chgLabel(n2_CHG));
             Serial.printf("  MQTT online:   %s\n",   mqttOnline?"YES":"NO");
             Serial.printf("  Free heap:     %u B\n", esp_get_free_heap_size());
             if (nodeOta.active)
@@ -1017,7 +1136,7 @@ void setup() {
     xTaskCreatePinnedToCore(appTask,  "App",  6144,  NULL, 2, &appTaskHandle,  1);
     xTaskCreatePinnedToCore(otaTask,  "OTA",  8192,  NULL, 1, &otaTaskHandle,  1);
 
-    Serial.println("[OK] Sensor gateway started (with OTA)");
+    Serial.println("[OK] Sensor gateway started (with OTA + INA219)");
     vTaskSuspend(NULL);
 }
 
