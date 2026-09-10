@@ -394,10 +394,10 @@ static void flushCmqttPub() {
 // ================================================================
 static uint16_t buildDataJson(char* out, size_t outSize) {
     DynamicJsonDocument doc(PUB_JSON_DOC_SIZE);
-    doc["FId"] = "cmt6xup2a000142w245th8glj";
+    doc["FId"] = "cmtbikepa03ihoe01xj2j6zgn";
     doc["Id"]  = "M1";
     doc["UId"] = DEVICE_ID;
-    doc["BId"] = "cmt6xuqgx000542w23rst3vo2";
+    doc["BId"] = "cmtbikfry03iloe0172em7k2t";
     doc["DId"] = "D1";
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
