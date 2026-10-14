@@ -1,7 +1,7 @@
 // =============================================================================
 //  AgriInverse — Solenoid Valve Node  (v4 — TB6612FNG + INA219 battery SoC)
 //
-//  CHANGES FROM v3
+//  CHANGES FROM v3pollachi
 //  ----------------
 //  1. INA219 added on I2C (SDA=21, SCL=22). Battery state-of-charge is
 //     tracked by Coulomb counting (same method as the LiFePO4 logger:
