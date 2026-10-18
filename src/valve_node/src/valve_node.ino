@@ -1,39 +1,40 @@
 // =============================================================================
-//  AgriInverse — Solenoid Valve Node  (v4 — TB6612FNG + INA219 battery SoC)
+//  AgriInverse — Solenoid Valve Node  (v4.3 — TB6612FNG + INA219 battery SoC)
 //
-//  CHANGES FROM v3pollachi
+//  CHANGES FROM v4.1
+//  -----------------
+//  1. Shorter IDs: the ack's own "msgId" is now 16-bit (1..65535, max 5
+//     digits) instead of 32-bit (up to 10 digits). "replyTo" echoes the
+//     gateway's command msgId, which the gateway must also generate as
+//     16-bit — together that saves ~10 bytes per ack.
+//     FId / BId stay in the ack exactly as in v4.1.
+//
+//  CHANGES FROM v4
 //  ----------------
-//  1. INA219 added on I2C (SDA=21, SCL=22). Battery state-of-charge is
-//     tracked by Coulomb counting (same method as the LiFePO4 logger:
-//     OCV seed at boot, trapezoidal integration, full/empty snap-to-ref,
-//     NVS persistence with a resting-OCV sanity check at boot).
-//  2. Every "ack" now carries:
-//        "bat" : battery SoC in whole percent (0..100, or -1 if INA219 missing)
-//        "bv"  : battery bus voltage, 2 decimals (dropped automatically if
-//                the packet would get too close to the LoRa 255-byte limit)
-//  3. PIN REMAP — I2C needs 21/22, so Valve B moved:
-//        BIN1 21 -> 27,  BIN2 22 -> 32
-//     STBY is no longer a GPIO: tie TB6612 STBY directly to 3.3V in
-//     hardware (same idea as PWMA/PWMB). With AIN/BIN both LOW the chip is
-//     in "stop" (outputs high-impedance), so valves are still de-energised
-//     between pulses. Cost: ~1-2 mA TB6612 logic current instead of ~1 uA.
-//  4. The valve pulse is now metered: INA219 is sampled every 10 ms during
-//     the 300 ms pulse so the solenoid's charge is actually counted.
-//  5. Empty-voltage snap only applies at rest, so the voltage sag during a
-//     valve pulse can't falsely zero the SoC.
-//  6. SoC is saved to NVS right before OTA (OTA reboots the node).
-//  7. sendRaw() refuses to transmit a body that won't fit in one LoRa packet
-//     instead of letting it be silently truncated into broken JSON.
+//  1. Every "ack" now also carries:
+//        "ib" : battery current in mA, smoothed  (+ = charging, - = discharging)
+//        "cs" : charge status  0 = discharging, 1 = charging, 2 = full, 3 = idle
+//               (idle = solar is just covering the load, ~0 mA in/out)
+//  2. "node":"Solenoid valve" removed from the valve ack to make room
+//     (the gateway's mesh-ack path never reads it). ota_ack keeps it.
+//  3. Reported current is an EMA of the 1 s idle samples, so the valve
+//     pulse spike doesn't distort "ib" / "cs".
+//  4. Serial battery line now prints the charge status.
+//
+//  CHANGES FROM v3 (kept)
+//  ----------------------
+//  - INA219 on I2C (SDA=21, SCL=22), Coulomb-counted SoC with OCV seed,
+//    full/empty snap, NVS persistence, boot OCV sanity check.
+//  - Ack carries "bat" (SoC %, -1 if INA219 missing) and "bv" (bus volts,
+//    dropped automatically if the packet would get too long).
+//  - Valve B on 27/32; TB6612 PWMA, PWMB, STBY hardwired to 3.3V.
+//  - Valve pulse metered at 10 ms; SoC saved before OTA; oversize TX refused.
 //
 //  Pins used:
 //    LoRa  : SS 5, RST 14, DIO0 26 (+ VSPI 18/19/23)
 //    Valve : AIN1 16, AIN2 17, BIN1 27, BIN2 32
 //    INA219: SDA 21, SCL 22
-//    TB6612: PWMA, PWMB, STBY -> 3.3V (hardwired)
-//    GPIO34/35: input-only, unused (cannot drive outputs or I2C)
-//
-//  Everything else — mesh routing, dedupe, hop/relay, OTA, ack format —
-//  is unchanged from v3 apart from the two added ack fields.
+//    TB6612: PWMA, PWMB, STBY -> 3.3V (hardwired), VM -> 12V boost
 // =============================================================================
 
 #include <SPI.h>
@@ -65,8 +66,8 @@
 //  SECTION 2 — NODE IDENTITY  (EDIT THESE PER PHYSICAL NODE)
 // =============================================================================
 
-#define MY_VID   15                                  // 1..15, unique per node
-#define MY_DID   "DId15"                              // human-readable label
+#define MY_VID   11                                  // 1..15, unique per node
+#define MY_DID   "DId11"                             // human-readable label
 #define MY_FID   "cmswukkav000d420ine0pfxmw"         // farm id
 #define MY_BID   "cmswuklzh000h420ih0axdrgj"         // block id
 #define MY_UID   "66"                                // same across the whole farm
@@ -82,16 +83,14 @@
 //  valves are de-energised whenever both direction pins are LOW.
 //
 //  Recommended: 10k pull-downs from AIN1/AIN2/BIN1/BIN2 to GND so the
-//  inputs are firmly LOW while the ESP32 is booting (the TB6612 has weak
-//  internal pull-downs, but external ones remove any doubt now that STBY
-//  is no longer holding the chip in standby).
+//  inputs are firmly LOW while the ESP32 is booting.
 // =============================================================================
 
 // Valve A
 #define AIN1  16
 #define AIN2  17
 
-// Valve B  (moved off 21/22 — those are now the INA219 I2C bus)
+// Valve B
 #define BIN1  27
 #define BIN2  32
 
@@ -106,10 +105,11 @@ ValveState valveStateB = VS_UNKNOWN;
 //  SECTION 3B — BATTERY MONITOR (INA219, Coulomb counting)
 //
 //  Wiring (high-side): battery+ -> INA219 VIN+ ; INA219 VIN- -> node supply
-//  (TB6612 VM + ESP32 regulator). Any charger/solar output must connect on
-//  the VIN- side so charge current flows back through the shunt.
+//  (12V boost IN + 3.3V regulator IN). Solar/charger output (after the
+//  diode) must connect on the VIN- side so charge current flows back
+//  through the shunt.
 //
-//  Defaults assume a single-cell LiFePO4, 6000 mAh (same as the logger).
+//  Defaults assume a single-cell LiFePO4, 6000 mAh.
 //  If this node's pack is different, change capacity + the OCV table.
 // =============================================================================
 
@@ -121,21 +121,20 @@ bool inaOk = false;
 
 const float NOMINAL_CAPACITY_MAH = 6000.0f;
 
-const float V_FULL_CV             = 3.60f;  // charger CV target
+const float V_FULL_CV             = 3.60f;  // charger CV target (set ~0.02 V below measured CV)
 const float V_EMPTY_CUTOFF        = 2.50f;  // ~0% SoC (checked at rest only)
 const float FULL_TAPER_CURRENT_MA = 150.0f;
 const float FULL_TAPER_HOLD_S     = 60.0f;
 
-// "At rest" for this node means "no valve pulse". The ESP32 + LoRa in RX
-// already draw ~50-90 mA continuously, so the logger's 30 mA threshold
-// would never be met here and the boot OCV sanity check would never run.
+// "At rest" for this node means "no valve pulse". ESP32 + LoRa RX already
+// draw ~50-90 mA continuously.
 const float RESTING_CURRENT_MA = 150.0f;
 
 const float OCV_MISMATCH_THRESHOLD_PERCENT = 25.0f;
 
-// Sign convention used below: + = discharging, - = charging.
-// -1.0 matches the fix in the battery logger (shunt reads reversed).
-// If SoC climbs while the node is just idling on battery, set this to +1.0.
+// Internal sign convention: + = discharging, - = charging.
+// If SoC climbs while the node is just idling on battery at night,
+// change this to +1.0.
 const float CURRENT_SIGN = -1.0f;
 
 const char* BAT_NVS_NS = "socdata";
@@ -153,6 +152,13 @@ unsigned long lastBatSaveMs   = 0;
 unsigned long lastBatPrintMs  = 0;
 float lastSavedSoC         = -1.0f;
 float fullTaperTimerS      = 0.0f;
+
+// --- Charge status + reported current (NEW in v4.1) ---
+const float CHG_THRESHOLD_MA = 20.0f;   // |I| below this = idle
+const float IB_FILTER_ALPHA  = 0.2f;    // EMA smoothing over 1 s idle samples
+float ibFiltered_mA = 0.0f;             // internal sign: + discharge, - charge
+
+enum ChargeState { CS_DISCHARGING = 0, CS_CHARGING = 1, CS_FULL = 2, CS_IDLE = 3 };
 
 struct OcvPoint { float v; float soc; };
 const OcvPoint ocvTable[] = {
@@ -178,6 +184,15 @@ float ocvToSoC(float v) {
 float batterySoC() {
     if (!inaOk || isnan(remainingCapacityMAh)) return -1.0f;
     return (remainingCapacityMAh / NOMINAL_CAPACITY_MAH) * 100.0f;
+}
+
+ChargeState chargeState() {
+    float i = ibFiltered_mA;   // + discharge, - charge
+    bool atCv = lastBatteryV >= (V_FULL_CV - 0.03f);
+    if (atCv && fabsf(i) < FULL_TAPER_CURRENT_MA && batterySoC() >= 99.0f) return CS_FULL;
+    if (i < -CHG_THRESHOLD_MA) return CS_CHARGING;
+    if (i >  CHG_THRESHOLD_MA) return CS_DISCHARGING;
+    return CS_IDLE;
 }
 
 void saveBattery() {
@@ -210,8 +225,7 @@ void updateBattery() {
     if (remainingCapacityMAh > NOMINAL_CAPACITY_MAH) remainingCapacityMAh = NOMINAL_CAPACITY_MAH;
     if (remainingCapacityMAh < 0) remainingCapacityMAh = 0;
 
-    // Empty snap — only when not pulsing a valve, otherwise the pulse sag
-    // could read below cutoff on a perfectly healthy battery.
+    // Empty snap — only when not pulsing a valve.
     bool atRest = fabsf(i) < RESTING_CURRENT_MA;
     if (atRest && v <= V_EMPTY_CUTOFF) remainingCapacityMAh = 0.0f;
 
@@ -244,7 +258,6 @@ void initBattery() {
     }
     inaOk = true;
     // Default calibration = 32V / 2A range (±3.2A readable with 0.1Ω shunt).
-    // Keep it unless the valve pulse can exceed ~3A.
 
     Preferences p;
     p.begin(BAT_NVS_NS, true);
@@ -276,6 +289,7 @@ void initBattery() {
 
     lastCurrent_mA  = bootI;
     lastBatteryV    = bootV;
+    ibFiltered_mA   = bootI;
     lastBatSampleMs = millis();
     lastBatSaveMs   = millis();
     lastSavedSoC    = batterySoC();
@@ -468,26 +482,37 @@ void relayEnvelope(StaticJsonDocument<600>& doc, int hop, int rssi, const char* 
 //  SECTION 11 — ACK / OTA_ACK SENDERS
 // =============================================================================
 
+// 16-bit, never 0 (0 means "no msgId" and is dropped by every node).
+// 5 digits max instead of 10 — enough for dedupe within the 30 s cache.
+uint16_t newShortId() {
+    uint16_t v;
+    do { v = (uint16_t)(esp_random() & 0xFFFF); } while (v == 0);
+    return v;
+}
+
 void sendAck(const String& status, const char* fid, const char* bid,
             uint32_t replyToMsgId) {
     StaticJsonDocument<384> ack;
     ack["type"]    = "ack";
     ack["UId"]     = MY_UID;
     ack["VId"]     = MY_VID;
-    ack["msgId"]   = (uint32_t)esp_random();
-    ack["replyTo"] = replyToMsgId;
+    ack["msgId"]   = newShortId();
+    ack["replyTo"] = replyToMsgId;          // echoes the gateway's (now 16-bit) msgId
     ack["hop"]     = DEFAULT_HOP_COUNT;
     ack["FId"]     = fid;
     ack["BId"]     = bid;
     ack["from"]    = MY_DID;
-    ack["node"]    = "Solenoid valve";
     ack["status"]  = status;
 
-    // Battery — take a fresh sample so the value reflects post-pulse state.
+    // Battery — take a fresh sample so V reflects post-pulse state.
     updateBattery();
     float soc = batterySoC();
     ack["bat"] = (soc < 0) ? -1 : (int)lroundf(soc);
-    if (inaOk) ack["bv"] = serialized(String(lastBatteryV, 2));
+    if (inaOk) {
+        ack["ib"] = (int)lroundf(-ibFiltered_mA);   // reported: + charging, - discharging
+        ack["cs"] = (int)chargeState();             // 0 dis, 1 chg, 2 full, 3 idle
+        ack["bv"] = serialized(String(lastBatteryV, 2));
+    }
 
     String out;
     serializeJson(ack, out);
@@ -514,7 +539,7 @@ void sendOtaAck(bool ok, const char* fid, const char* bid,
     ack["type"]    = "ota_ack";
     ack["UId"]     = MY_UID;
     ack["VId"]     = MY_VID;
-    ack["msgId"]   = (uint32_t)esp_random();
+    ack["msgId"]   = newShortId();
     ack["replyTo"] = replyToMsgId;
     ack["hop"]     = DEFAULT_HOP_COUNT;
     ack["FId"]     = fid;
@@ -809,7 +834,7 @@ void setup() {
     loadValveState();
     randomSeed(esp_random());
 
-    Serial.println("\n🚀 Valve Node (TB6612FNG + INA219) starting...");
+    Serial.println("\n🚀 Valve Node v4.3 (TB6612FNG + INA219) starting...");
     Serial.printf("📛 VId:%d  DId:%s\n", MY_VID, MY_DID);
 
     initBattery();
@@ -854,16 +879,19 @@ void loop() {
         processPacket(dest, src, buf, len, rssi);
     }
 
-    // Battery Coulomb counting — non-blocking, once per second
+    // Battery Coulomb counting — non-blocking, once per second.
+    // Reported current is smoothed here (idle samples only, never the pulse).
     if (inaOk && (millis() - lastBatSampleMs) >= BAT_SAMPLE_MS) {
         updateBattery();
+        ibFiltered_mA += IB_FILTER_ALPHA * (lastCurrent_mA - ibFiltered_mA);
         maybeSaveBattery();
     }
     if (inaOk && (millis() - lastBatPrintMs) >= BAT_PRINT_MS) {
         lastBatPrintMs = millis();
-        Serial.printf("🔋 V:%.3fV I:%.1fmA Rem:%.0f/%.0fmAh SoC:%.1f%%\n",
-                      lastBatteryV, lastCurrent_mA, remainingCapacityMAh,
-                      NOMINAL_CAPACITY_MAH, batterySoC());
+        static const char* csName[] = { "DISCHARGING", "CHARGING", "FULL", "IDLE" };
+        Serial.printf("🔋 V:%.3fV I:%+.1fmA Rem:%.0f/%.0fmAh SoC:%.1f%% %s\n",
+                      lastBatteryV, -ibFiltered_mA, remainingCapacityMAh,
+                      NOMINAL_CAPACITY_MAH, batterySoC(), csName[chargeState()]);
     }
 
     delay(5);
