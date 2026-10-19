@@ -1,34 +1,44 @@
 // =============================================================================
-//  AgriInverse — Solenoid Valve Node  (v4.3 — TB6612FNG + INA219 battery SoC)
+//  AgriInverse — Solenoid Valve Node  (v4.4 — accurate INA219 battery gauge)
 //
-//  CHANGES FROM v4.1
-//  -----------------
-//  1. Shorter IDs: the ack's own "msgId" is now 16-bit (1..65535, max 5
-//     digits) instead of 32-bit (up to 10 digits). "replyTo" echoes the
-//     gateway's command msgId, which the gateway must also generate as
-//     16-bit — together that saves ~10 bytes per ack.
-//     FId / BId stay in the ack exactly as in v4.1.
+//  CHANGES FROM v4.3  (battery measurement only — radio/mesh/valve logic
+//  and the ack format are unchanged, so the gateway needs no update)
+//  -----------------------------------------------------------------
+//  1. Own INA219 register driver (Adafruit_INA219 removed).
+//     - 128-sample averaging on shunt AND bus ADC: rejects the 12 V boost
+//       converter's switching ripple, which aliased into the old 12-bit
+//       single-sample readings as tens of mA of random error.
+//     - Current is computed from the SHUNT VOLTAGE register (10 uV/LSB)
+//       / R_SHUNT, not the CURRENT register. It does not depend on the
+//       volatile calibration register, so a sensor brown-out can never
+//       silently zero the current.
+//     - Cell voltage is corrected for the shunt drop (bus + shunt), so
+//       "bv" is the real cell voltage, not cell minus I*R.
+//     - One setting (CELL_ON_VIN_PLUS) picks the wiring; the sign follows.
+//     - Config register is checked every 10 s and rewritten if it was lost;
+//       5 failed reads -> INA marked missing, retried every 30 s.
+//  2. Valve pulse metered in a FAST mode (8-sample avg, ~4.3 ms) sampled
+//     every 5 ms plus a 60 ms tail, then back to 128-sample slow mode.
+//     Shunt clipping (pulse current above the INA219 range) is detected
+//     and reported on serial.
+//  3. Idle sampling every 250 ms instead of 1 s.
+//  4. Self-calibrating gauge (same logic as the AgriNode TX gauge):
+//     - 100 % anchored when V >= FULL_V and charge current tapered, 120 s
+//     - 0 %   anchored when loaded V <= EMPTY_V at rest, 30 s
+//     - real capacity LEARNED from one full -> empty run
+//     - charge efficiency applied to charge current
+//     - displayed % never rises while discharging / falls while charging,
+//       moves max 1 %/min, holds 99 % until really full, 1 % until empty
+//     - "~" on serial = not yet confirmed by a full or empty anchor
+//  5. Boot OCV sanity check no longer runs while CHARGING (charging lifts
+//     LiFePO4 voltage and used to reseed SoC to ~99 % on a daytime reboot).
+//  6. NVS: v4.3's saved "remMAh" is migrated automatically.
 //
-//  CHANGES FROM v4
-//  ----------------
-//  1. Every "ack" now also carries:
-//        "ib" : battery current in mA, smoothed  (+ = charging, - = discharging)
-//        "cs" : charge status  0 = discharging, 1 = charging, 2 = full, 3 = idle
-//               (idle = solar is just covering the load, ~0 mA in/out)
-//  2. "node":"Solenoid valve" removed from the valve ack to make room
-//     (the gateway's mesh-ack path never reads it). ota_ack keeps it.
-//  3. Reported current is an EMA of the 1 s idle samples, so the valve
-//     pulse spike doesn't distort "ib" / "cs".
-//  4. Serial battery line now prints the charge status.
-//
-//  CHANGES FROM v3 (kept)
-//  ----------------------
-//  - INA219 on I2C (SDA=21, SCL=22), Coulomb-counted SoC with OCV seed,
-//    full/empty snap, NVS persistence, boot OCV sanity check.
-//  - Ack carries "bat" (SoC %, -1 if INA219 missing) and "bv" (bus volts,
-//    dropped automatically if the packet would get too long).
-//  - Valve B on 27/32; TB6612 PWMA, PWMB, STBY hardwired to 3.3V.
-//  - Valve pulse metered at 10 ms; SoC saved before OTA; oversize TX refused.
+//  Ack fields unchanged:
+//     "bat" displayed SoC % (-1 if INA219 missing)
+//     "ib"  battery current mA, smoothed (+ charging, - discharging)
+//     "cs"  0 discharging, 1 charging, 2 full, 3 idle
+//     "bv"  cell voltage (dropped automatically if the packet is too long)
 //
 //  Pins used:
 //    LoRa  : SS 5, RST 14, DIO0 26 (+ VSPI 18/19/23)
@@ -45,7 +55,6 @@
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include <Wire.h>
-#include <Adafruit_INA219.h>
 
 // =============================================================================
 //  SECTION 1 — LoRa PINS & FREQUENCY
@@ -102,197 +111,501 @@ ValveState valveStateA = VS_UNKNOWN;
 ValveState valveStateB = VS_UNKNOWN;
 
 // =============================================================================
-//  SECTION 3B — BATTERY MONITOR (INA219, Coulomb counting)
+//  SECTION 3B — BATTERY MONITOR (INA219 direct driver + self-calibrating gauge)
 //
-//  Wiring (high-side): battery+ -> INA219 VIN+ ; INA219 VIN- -> node supply
-//  (12V boost IN + 3.3V regulator IN). Solar/charger output (after the
-//  diode) must connect on the VIN- side so charge current flows back
-//  through the shunt.
+//  Wiring (high-side, CELL_ON_VIN_PLUS = 1):
+//    battery+ -> INA219 VIN+ ; INA219 VIN- -> node supply bus
+//    (12V boost IN + 3.3V regulator IN + solar charger OUT).
+//    Battery- -> common GND.  INA219 VCC -> 3.3V, SDA 21, SCL 22.
+//  Everything except the cell itself must be on the VIN- side, otherwise
+//  charge current bypasses the shunt.
 //
-//  Defaults assume a single-cell LiFePO4, 6000 mAh.
-//  If this node's pack is different, change capacity + the OCV table.
+//  If your board is wired the other way (load/charger on VIN+, cell+ on
+//  VIN-, like the AgriNode TX), set CELL_ON_VIN_PLUS to 0. Nothing else
+//  changes — the current sign and the voltage correction follow.
+//
+//  Check: at night with no valve activity the serial line must show
+//  DISCHARGING and I around -50..-90 mA. If it shows CHARGING, the
+//  CELL_ON_VIN_PLUS setting doesn't match the wiring.
 // =============================================================================
 
 #define I2C_SDA 21
 #define I2C_SCL 22
 
-Adafruit_INA219 ina219;
-bool inaOk = false;
+#define CELL_ON_VIN_PLUS   1        // 1 = cell on VIN+ (v4.3 wiring), 0 = cell on VIN-
+#define INA_DEBUG          0        // 1 = print raw INA219 registers every 30 s
 
+const float R_SHUNT_OHM       = 0.100f;  // R100 on the usual breakout
+const float CURRENT_GAIN_TRIM = 1.000f;  // optional: (meter mA / shown mA)
+const float SHUNT_OFFSET_MV   = 0.000f;  // optional: shunt mV shown with 0 A flowing
+
+#define INA_ADDR        0x40       // A0 = A1 = GND
+#define INA_REG_CONFIG  0x00
+#define INA_REG_SHUNTV  0x01
+#define INA_REG_BUSV    0x02
+
+// CONFIG = BRNG | PG | BADC | SADC | MODE
+//  SLOW: 16 V bus, PGA /8 (±320 mV = ±3.2 A on 0.1R), 128-sample average on
+//        shunt and bus (68.1 ms each, ~136 ms per pair), shunt+bus continuous.
+//  FAST: same range, shunt 8-sample average (4.26 ms), bus 9-bit (84 us).
+#define INA_CFG_SLOW         0x1FFF
+#define INA_CFG_FAST         0x185F
+#define INA_SLOW_SETTLE_MS   150
+#define INA_FAST_SETTLE_MS   6
+#define SHUNT_CLIP_RAW       31900      // full scale is ±32000 (±320 mV)
+
+bool     inaOk          = false;
+bool     gaugeReady     = false;
+bool     wireStarted    = false;
+uint16_t inaCfgNow      = INA_CFG_SLOW;
+uint8_t  inaFailCount   = 0;
+bool     shuntClipped   = false;
+int16_t  lastShuntRaw   = 0;
+uint16_t lastBusRaw     = 0;
+
+// --- Pack (single-cell LiFePO4). Capacity is only the starting value;
+//     the real capacity is learned after one full -> empty run. ---
 const float NOMINAL_CAPACITY_MAH = 6000.0f;
+const float FULL_V               = 3.45f;  // full above this at low current
+const float EMPTY_V              = 2.90f;  // 0 % under (resting) load
+const float FULL_TAPER_MA        = 150.0f; // |I| below this at FULL_V = tapered
+const float FULL_HOLD_S          = 120.0f;
+const float EMPTY_HOLD_S         = 30.0f;
+const float CHARGE_EFFICIENCY    = 0.99f;
 
-const float V_FULL_CV             = 3.60f;  // charger CV target (set ~0.02 V below measured CV)
-const float V_EMPTY_CUTOFF        = 2.50f;  // ~0% SoC (checked at rest only)
-const float FULL_TAPER_CURRENT_MA = 150.0f;
-const float FULL_TAPER_HOLD_S     = 60.0f;
-
-// "At rest" for this node means "no valve pulse". ESP32 + LoRa RX already
-// draw ~50-90 mA continuously.
-const float RESTING_CURRENT_MA = 150.0f;
-
+// "At rest" = no valve pulse. ESP32 + LoRa RX draw ~50-90 mA continuously.
+const float RESTING_CURRENT_MA   = 150.0f;
 const float OCV_MISMATCH_THRESHOLD_PERCENT = 25.0f;
 
-// Internal sign convention: + = discharging, - = charging.
-// If SoC climbs while the node is just idling on battery at night,
-// change this to +1.0.
-const float CURRENT_SIGN = (-1.0f);
+const char*    BAT_NVS_NS = "socdata";
+const uint32_t GAUGE_VER  = 0xBA770044UL;  // change -> gauge restarts clean
 
-const char* BAT_NVS_NS = "socdata";
-const float BAT_SAVE_THRESHOLD_PERCENT = 1.0f;
-const unsigned long BAT_SAVE_INTERVAL_MS  = 5UL * 60UL * 1000UL;
-const unsigned long BAT_SAMPLE_MS         = 1000;   // idle sampling
-const unsigned long PULSE_SAMPLE_MS       = 10;     // sampling during a valve pulse
-const unsigned long BAT_PRINT_MS          = 30000;
+const unsigned long BAT_SAVE_INTERVAL_MS = 5UL * 60UL * 1000UL;
+const unsigned long BAT_SAMPLE_MS        = 250;     // idle sampling
+const unsigned long PULSE_SAMPLE_MS      = 5;       // during a valve pulse
+const unsigned long POST_PULSE_MS        = 60;      // boost recovery tail
+const unsigned long DISP_UPDATE_MS       = 60000;   // displayed % step period
+const unsigned long INA_HEALTH_MS        = 10000;
+const unsigned long INA_RETRY_MS         = 30000;
+const unsigned long BAT_PRINT_MS         = 30000;
 
-float remainingCapacityMAh = NAN;
-float lastCurrent_mA       = 0.0f;
-float lastBatteryV         = 0.0f;
+#define FL_SEEN_FULL    0x01UL   // full seen since last empty
+#define FL_ANCHORED     0x02UL   // ever confirmed full/empty
+#define FL_CAP_LEARNED  0x04UL   // capacity measured at least once
+
+float    g_remain   = NAN;                    // mAh left
+float    g_cap      = NOMINAL_CAPACITY_MAH;   // mAh (learned)
+float    g_dis      = 0.0f;                   // net mAh out since last full
+uint32_t g_flags    = 0;
+int      g_disp     = -1;                     // displayed %
+bool     g_fullNow  = false;
+bool     g_emptyNow = false;
+float    fullTimerS  = 0.0f;
+float    emptyTimerS = 0.0f;
+
+float lastCurrent_mA = 0.0f;   // internal sign: + discharge, - charge
+float lastBatteryV   = 0.0f;   // cell voltage (shunt drop corrected)
 unsigned long lastBatSampleMs = 0;
 unsigned long lastBatSaveMs   = 0;
 unsigned long lastBatPrintMs  = 0;
-float lastSavedSoC         = -1.0f;
-float fullTaperTimerS      = 0.0f;
+unsigned long lastDispMs      = 0;
+unsigned long lastHealthMs    = 0;
+unsigned long lastRetryMs     = 0;
+int lastSavedDisp = -1;
 
-// --- Charge status + reported current (NEW in v4.1) ---
+// --- Charge status + reported current ---
 const float CHG_THRESHOLD_MA = 20.0f;   // |I| below this = idle
-const float IB_FILTER_ALPHA  = 0.2f;    // EMA smoothing over 1 s idle samples
+const float IB_FILTER_ALPHA  = 0.05f;   // EMA on 250 ms samples (~5 s)
 float ibFiltered_mA = 0.0f;             // internal sign: + discharge, - charge
 
 enum ChargeState { CS_DISCHARGING = 0, CS_CHARGING = 1, CS_FULL = 2, CS_IDLE = 3 };
 
-struct OcvPoint { float v; float soc; };
-const OcvPoint ocvTable[] = {
-    {3.65, 100.0}, {3.45, 99.0}, {3.35, 95.0}, {3.30, 90.0}, {3.28, 80.0},
-    {3.26,  70.0}, {3.25, 60.0}, {3.23, 50.0}, {3.21, 40.0}, {3.18, 30.0},
-    {3.15,  20.0}, {3.10, 15.0}, {3.00, 10.0}, {2.80,  5.0}, {2.50,  0.0}
-};
-const int OCV_TABLE_SIZE = sizeof(ocvTable) / sizeof(ocvTable[0]);
+// LiFePO4 resting voltage -> % (first guess / sanity check only)
+const float OCV_V[]   = { 2.50f, 2.90f, 3.00f, 3.10f, 3.20f, 3.22f,
+                          3.25f, 3.26f, 3.27f, 3.28f, 3.30f, 3.32f,
+                          3.33f, 3.35f, 3.40f };
+const float OCV_PCT[] = {   0.f,   5.f,   9.f,  14.f,  17.f,  20.f,
+                           30.f,  40.f,  50.f,  60.f,  70.f,  80.f,
+                           90.f,  99.f, 100.f };
+const int OCV_N = sizeof(OCV_V) / sizeof(OCV_V[0]);
 
 float ocvToSoC(float v) {
-    if (v >= ocvTable[0].v) return 100.0f;
-    if (v <= ocvTable[OCV_TABLE_SIZE - 1].v) return 0.0f;
-    for (int i = 0; i < OCV_TABLE_SIZE - 1; i++) {
-        float vHigh = ocvTable[i].v, vLow = ocvTable[i + 1].v;
-        if (v <= vHigh && v >= vLow) {
-            float frac = (v - vLow) / (vHigh - vLow);
-            return ocvTable[i + 1].soc + frac * (ocvTable[i].soc - ocvTable[i + 1].soc);
+    if (v <= OCV_V[0])         return 0.0f;
+    if (v >= OCV_V[OCV_N - 1]) return 100.0f;
+    for (int i = 1; i < OCV_N; i++) {
+        if (v <= OCV_V[i]) {
+            float t = (v - OCV_V[i - 1]) / (OCV_V[i] - OCV_V[i - 1]);
+            return OCV_PCT[i - 1] + t * (OCV_PCT[i] - OCV_PCT[i - 1]);
         }
     }
-    return 50.0f;
+    return 100.0f;
 }
 
-float batterySoC() {
-    if (!inaOk || isnan(remainingCapacityMAh)) return -1.0f;
-    return (remainingCapacityMAh / NOMINAL_CAPACITY_MAH) * 100.0f;
+// ---------------- INA219 low level ----------------
+
+bool inaWrite(uint8_t reg, uint16_t val) {
+    Wire.beginTransmission(INA_ADDR);
+    Wire.write(reg);
+    Wire.write((uint8_t)(val >> 8));
+    Wire.write((uint8_t)(val & 0xFF));
+    return Wire.endTransmission() == 0;
+}
+
+bool inaRead(uint8_t reg, uint16_t& out) {
+    Wire.beginTransmission(INA_ADDR);
+    Wire.write(reg);
+    if (Wire.endTransmission() != 0) return false;
+    if (Wire.requestFrom((uint8_t)INA_ADDR, (uint8_t)2) != 2) return false;
+    uint8_t hi = Wire.read();
+    uint8_t lo = Wire.read();
+    out = ((uint16_t)hi << 8) | lo;
+    return true;
+}
+
+// Write CONFIG and verify by read-back (also proves the chip is there).
+bool inaSetConfig(uint16_t cfg) {
+    if (!inaWrite(INA_REG_CONFIG, cfg)) return false;
+    uint16_t rb = 0;
+    if (!inaRead(INA_REG_CONFIG, rb) || rb != cfg) return false;
+    inaCfgNow = cfg;
+    return true;
+}
+
+void inaUseFast() {
+    if (!inaOk) return;
+    if (inaSetConfig(INA_CFG_FAST)) delay(INA_FAST_SETTLE_MS);
+}
+
+void inaUseSlow() {
+    if (!inaOk) return;
+    inaSetConfig(INA_CFG_SLOW);
+}
+
+// One reading. vCell = real cell voltage, iMa: + discharging, - charging.
+bool inaSample(float& vCell, float& iMa) {
+    uint16_t sh = 0, bus = 0;
+    if (!inaRead(INA_REG_SHUNTV, sh) || !inaRead(INA_REG_BUSV, bus)) {
+        if (++inaFailCount >= 5) {
+            inaOk = false;
+            Serial.println("⚠️ INA219 stopped responding — battery reporting disabled (bat:-1)");
+        }
+        return false;
+    }
+    inaFailCount = 0;
+
+    int16_t s = (int16_t)sh;
+    lastShuntRaw = s;
+    lastBusRaw   = bus;
+    if (s >= SHUNT_CLIP_RAW || s <= -SHUNT_CLIP_RAW) shuntClipped = true;
+
+    float vsh_mV = (float)s * 0.01f - SHUNT_OFFSET_MV;          // 10 uV / LSB
+    float vbus   = (float)(bus >> 3) * 0.004f;                  // 4 mV / LSB
+    float i      = (vsh_mV / R_SHUNT_OHM) * CURRENT_GAIN_TRIM;  // mV / ohm = mA
+
+#if CELL_ON_VIN_PLUS
+    // Positive shunt = VIN+ -> VIN- = cell -> load = discharging.
+    // Bus is measured at VIN-, so add the shunt drop back for the cell.
+    iMa   = i;
+    vCell = vbus + vsh_mV / 1000.0f;
+#else
+    // Positive shunt = load/charger node -> cell = charging.
+    // Bus is measured at VIN- = cell, already the true cell voltage.
+    iMa   = -i;
+    vCell = vbus;
+#endif
+    return true;
+}
+
+// ---------------- Gauge ----------------
+
+int batteryPct() {
+    return (inaOk && gaugeReady && g_disp >= 0) ? g_disp : -1;
+}
+
+float batterySoCRaw() {
+    if (!gaugeReady || isnan(g_remain)) return -1.0f;
+    return g_remain / g_cap * 100.0f;
 }
 
 ChargeState chargeState() {
     float i = ibFiltered_mA;   // + discharge, - charge
-    bool atCv = lastBatteryV >= (V_FULL_CV - 0.03f);
-    if (atCv && fabsf(i) < FULL_TAPER_CURRENT_MA && batterySoC() >= 99.0f) return CS_FULL;
+    if (g_disp >= 99 && lastBatteryV >= FULL_V &&
+        fabsf(i) < FULL_TAPER_MA && i < CHG_THRESHOLD_MA) return CS_FULL;
     if (i < -CHG_THRESHOLD_MA) return CS_CHARGING;
     if (i >  CHG_THRESHOLD_MA) return CS_DISCHARGING;
     return CS_IDLE;
 }
 
 void saveBattery() {
-    if (!inaOk || isnan(remainingCapacityMAh)) return;
+    if (!gaugeReady || isnan(g_remain)) return;
     Preferences p;
     p.begin(BAT_NVS_NS, false);
-    p.putFloat("remMAh", remainingCapacityMAh);
+    p.putUInt ("gv",   GAUGE_VER);
+    p.putFloat("rem",  g_remain);
+    p.putFloat("cap",  g_cap);
+    p.putFloat("dis",  g_dis);
+    p.putUInt ("flg",  g_flags);
+    p.putInt  ("disp", g_disp);
     p.end();
-    lastSavedSoC  = batterySoC();
+    lastSavedDisp = g_disp;
     lastBatSaveMs = millis();
 }
 
-// One Coulomb-counting step. Safe to call at any rate; integrates over the
-// real elapsed time since the previous call (trapezoidal).
+void maybeSaveBattery() {
+    if (!gaugeReady) return;
+    bool changed     = (g_disp != lastSavedDisp);
+    bool timeElapsed = (millis() - lastBatSaveMs) >= BAT_SAVE_INTERVAL_MS;
+    if (changed || timeElapsed) saveBattery();
+}
+
+// Phone-style displayed percentage. force = jump straight to target.
+void updateDisplayPct(bool force) {
+    if (!gaugeReady || isnan(g_remain)) return;
+
+    int target = (int)lroundf(g_remain / g_cap * 100.0f);
+    if (target >= 100 && !(g_fullNow || (g_disp == 100 && g_remain >= 0.99f * g_cap)))
+        target = 99;                      // 100 % only when really full
+    if (target <= 0 && !g_emptyNow)
+        target = 1;                       // 0 % only at real cutoff
+
+    if (force || g_disp < 0) {
+        g_disp = target;
+    } else {
+        int step = target - g_disp;
+        if (ibFiltered_mA >  CHG_THRESHOLD_MA && step > 0) step = 0;  // discharging: never up
+        if (ibFiltered_mA < -CHG_THRESHOLD_MA && step < 0) step = 0;  // charging: never down
+        if (step >  1) step =  1;
+        if (step < -1) step = -1;
+        g_disp += step;
+    }
+    g_disp = constrain(g_disp, 0, 100);
+}
+
+// One Coulomb-counting step. Integrates over the real elapsed time since
+// the previous call (trapezoidal). Safe to call at any rate.
 void updateBattery() {
     if (!inaOk) return;
 
+    float v, i;
+    if (!inaSample(v, i)) return;
+
     unsigned long now = millis();
-    float dtH = (now - lastBatSampleMs) / 3600000.0f;
+    float dtS = (now - lastBatSampleMs) / 1000.0f;
     lastBatSampleMs = now;
 
-    float v = ina219.getBusVoltage_V();
-    float i = CURRENT_SIGN * ina219.getCurrent_mA();   // + discharge, - charge
-
-    float avg = (i + lastCurrent_mA) * 0.5f;
-    remainingCapacityMAh -= avg * dtH;
+    float avg = 0.5f * (i + lastCurrent_mA);
     lastCurrent_mA = i;
     lastBatteryV   = v;
 
-    if (remainingCapacityMAh > NOMINAL_CAPACITY_MAH) remainingCapacityMAh = NOMINAL_CAPACITY_MAH;
-    if (remainingCapacityMAh < 0) remainingCapacityMAh = 0;
+    if (!gaugeReady) return;
 
-    // Empty snap — only when not pulsing a valve.
-    bool atRest = fabsf(i) < RESTING_CURRENT_MA;
-    if (atRest && v <= V_EMPTY_CUTOFF) remainingCapacityMAh = 0.0f;
-
-    // Full snap — CV voltage reached and charge current tapered off.
-    bool nearFull = v >= V_FULL_CV;
-    bool tapered  = (i < 0) && (fabsf(i) < FULL_TAPER_CURRENT_MA);
-    if (nearFull && tapered) {
-        fullTaperTimerS += dtH * 3600.0f;
-        if (fullTaperTimerS >= FULL_TAPER_HOLD_S) remainingCapacityMAh = NOMINAL_CAPACITY_MAH;
+    float dq = avg * dtS / 3600.0f;            // mAh, + = out of the cell
+    if (dq >= 0.0f) {
+        g_remain -= dq;
+        g_dis    += dq;
     } else {
-        fullTaperTimerS = 0.0f;
+        g_remain -= dq * CHARGE_EFFICIENCY;    // adds charge
+        g_dis    += dq * CHARGE_EFFICIENCY;
+        if (g_dis < 0.0f) g_dis = 0.0f;
+    }
+    if (g_remain > g_cap) g_remain = g_cap;
+    if (g_remain < 0.0f)  g_remain = 0.0f;
+
+    // Anchors only from slow (averaged) samples, never during a pulse.
+    if (inaCfgNow != INA_CFG_SLOW) return;
+
+    // ---- 100 %: CV voltage reached and current tapered off ----
+    bool fullCond = (v >= FULL_V) && (fabsf(i) < FULL_TAPER_MA) && (i < CHG_THRESHOLD_MA);
+    if (fullCond) {
+        fullTimerS += dtS;
+        if (fullTimerS >= FULL_HOLD_S) {
+            if (!g_fullNow) {
+                g_fullNow = true;
+                g_remain  = g_cap;
+                g_dis     = 0.0f;
+                g_flags  |= FL_SEEN_FULL | FL_ANCHORED;
+                Serial.println("🔋 Full anchor — gauge set to 100 %");
+                saveBattery();
+            }
+            g_remain = g_cap;
+            g_dis    = 0.0f;
+        }
+    } else {
+        fullTimerS = 0.0f;
+        g_fullNow  = false;
+    }
+
+    // ---- 0 %: cutoff voltage under resting load; learn capacity ----
+    bool emptyCond = (v <= EMPTY_V) && (i > 0.0f) && (i < RESTING_CURRENT_MA);
+    if (emptyCond) {
+        emptyTimerS += dtS;
+        if (emptyTimerS >= EMPTY_HOLD_S) {
+            if (!g_emptyNow) {
+                g_emptyNow = true;
+                if ((g_flags & FL_SEEN_FULL) && g_dis > 0.25f * g_cap) {
+                    float learned = g_dis;
+                    if (g_flags & FL_CAP_LEARNED) g_cap = 0.7f * g_cap + 0.3f * learned;
+                    else                          g_cap = learned;
+                    g_cap = constrain(g_cap, 0.25f * NOMINAL_CAPACITY_MAH,
+                                             4.00f * NOMINAL_CAPACITY_MAH);
+                    g_flags |= FL_CAP_LEARNED;
+                    Serial.printf("🔋 Capacity learned: %.0f mAh\n", g_cap);
+                }
+                g_flags &= ~FL_SEEN_FULL;
+                g_flags |= FL_ANCHORED;
+                Serial.println("🔋 Empty anchor — gauge set to 0 %");
+                g_remain = 0.0f;
+                saveBattery();
+            }
+            g_remain = 0.0f;
+        }
+    } else {
+        emptyTimerS = 0.0f;
+        g_emptyNow  = false;
     }
 }
 
-void maybeSaveBattery() {
-    if (!inaOk) return;
-    float soc = batterySoC();
-    bool changedEnough = fabsf(soc - lastSavedSoC) >= BAT_SAVE_THRESHOLD_PERCENT;
-    bool timeElapsed   = (millis() - lastBatSaveMs) >= BAT_SAVE_INTERVAL_MS;
-    if (changedEnough || timeElapsed) saveBattery();
-}
-
-void initBattery() {
-    Wire.begin(I2C_SDA, I2C_SCL);
-    if (!ina219.begin(&Wire)) {
-        // Don't halt — a valve node must keep working without its sensor.
-        Serial.println("⚠️ INA219 not found — battery reporting disabled (bat:-1)");
-        inaOk = false;
-        return;
-    }
-    inaOk = true;
-    // Default calibration = 32V / 2A range (±3.2A readable with 0.1Ω shunt).
-
+// Load saved state (or seed from OCV). Called once, on the first
+// successful INA219 start.
+void gaugeRestore(float vBoot, float iBoot) {
     Preferences p;
     p.begin(BAT_NVS_NS, true);
-    bool hasSaved  = p.isKey("remMAh");
-    float savedMAh = hasSaved ? p.getFloat("remMAh", NAN) : NAN;
+    bool hasNew = (p.getUInt("gv", 0) == GAUGE_VER);
+    if (hasNew) {
+        g_remain = p.getFloat("rem", NAN);
+        g_cap    = p.getFloat("cap", NOMINAL_CAPACITY_MAH);
+        g_dis    = p.getFloat("dis", 0.0f);
+        g_flags  = p.getUInt ("flg", 0);
+        g_disp   = p.getInt  ("disp", -1);
+    } else if (p.isKey("remMAh")) {                // migrate v4.3 state
+        g_remain = p.getFloat("remMAh", NAN);
+        g_cap    = NOMINAL_CAPACITY_MAH;
+        g_dis    = 0.0f;
+        g_flags  = 0;
+        g_disp   = -1;
+        Serial.println("🔋 Migrated v4.3 battery state");
+    }
     p.end();
 
-    delay(200);
-    float bootV  = ina219.getBusVoltage_V();
-    float bootI  = CURRENT_SIGN * ina219.getCurrent_mA();
-    float ocvSoC = ocvToSoC(bootV);
+    if (!(g_cap > 0.25f * NOMINAL_CAPACITY_MAH && g_cap < 4.0f * NOMINAL_CAPACITY_MAH))
+        g_cap = NOMINAL_CAPACITY_MAH;
+    if (!(g_dis >= 0.0f && g_dis < 1.0e6f)) g_dis = 0.0f;
+    if (!(g_remain >= 0.0f && g_remain <= g_cap)) g_remain = NAN;
+    if (g_disp < -1 || g_disp > 100) g_disp = -1;
 
-    if (hasSaved && !isnan(savedMAh)) {
-        float savedSoC = (savedMAh / NOMINAL_CAPACITY_MAH) * 100.0f;
-        bool atRest   = fabsf(bootI) < RESTING_CURRENT_MA;
-        bool mismatch = fabsf(ocvSoC - savedSoC) > OCV_MISMATCH_THRESHOLD_PERCENT;
-        if (atRest && mismatch) {
-            remainingCapacityMAh = (ocvSoC / 100.0f) * NOMINAL_CAPACITY_MAH;
+    float ocvSoC = ocvToSoC(vBoot);
+
+    if (isnan(g_remain)) {
+        g_remain = ocvSoC / 100.0f * g_cap;
+        g_flags &= ~FL_ANCHORED;
+        g_disp   = -1;
+        Serial.printf("🔋 No saved state — OCV %.3fV -> %.0f%%\n", vBoot, ocvSoC);
+    } else {
+        float savedSoC = g_remain / g_cap * 100.0f;
+        // Only trust OCV while lightly discharging — charging lifts a
+        // LiFePO4 cell's voltage and would read ~99 %.
+        bool restingOk = (iBoot > -CHG_THRESHOLD_MA) && (iBoot < RESTING_CURRENT_MA);
+        bool mismatch  = fabsf(ocvSoC - savedSoC) > OCV_MISMATCH_THRESHOLD_PERCENT;
+        if (restingOk && mismatch) {
+            g_remain = ocvSoC / 100.0f * g_cap;
+            g_flags &= ~FL_ANCHORED;
+            g_disp   = -1;
             Serial.printf("🔋 Saved SoC %.0f%% conflicts with OCV %.0f%% — reseeding from OCV\n",
                           savedSoC, ocvSoC);
         } else {
-            remainingCapacityMAh = savedMAh;
-            Serial.printf("🔋 Restored %.0f mAh (%.0f%%) from flash\n", savedMAh, savedSoC);
+            Serial.printf("🔋 Restored %.0f/%.0f mAh (%.0f%%) from flash\n",
+                          g_remain, g_cap, savedSoC);
         }
-    } else {
-        remainingCapacityMAh = (ocvSoC / 100.0f) * NOMINAL_CAPACITY_MAH;
-        Serial.printf("🔋 No saved state — OCV %.2fV -> %.0f%%\n", bootV, ocvSoC);
     }
 
-    lastCurrent_mA  = bootI;
-    lastBatteryV    = bootV;
-    ibFiltered_mA   = bootI;
+    gaugeReady = true;
+    updateDisplayPct(g_disp < 0);
+    lastSavedDisp = g_disp;
+    lastBatSaveMs = millis();
+    lastDispMs    = millis();
+}
+
+// Start (or restart) the INA219. Safe to call again from loop().
+void initBattery() {
+    if (!wireStarted) {
+        Wire.begin(I2C_SDA, I2C_SCL);
+        Wire.setClock(400000);
+        wireStarted = true;
+    }
+
+    if (!inaSetConfig(INA_CFG_SLOW)) {
+        // Don't halt — a valve node must keep working without its sensor.
+        if (!gaugeReady) Serial.println("⚠️ INA219 not found — battery reporting disabled (bat:-1)");
+        inaOk = false;
+        return;
+    }
+    inaOk        = true;
+    inaFailCount = 0;
+    delay(INA_SLOW_SETTLE_MS);   // first averaged shunt+bus pair
+
+    float v, i;
+    if (!inaSample(v, i)) { inaOk = false; return; }
+
+    lastCurrent_mA  = i;
+    lastBatteryV    = v;
+    ibFiltered_mA   = i;
     lastBatSampleMs = millis();
-    lastBatSaveMs   = millis();
-    lastSavedSoC    = batterySoC();
+    lastHealthMs    = millis();
+
+    if (!gaugeReady) gaugeRestore(v, i);
+    Serial.printf("🔋 INA219 OK — V:%.3fV I:%+.1fmA (shunt %.3f ohm, cell on VIN%s)\n",
+                  v, -i, R_SHUNT_OHM, CELL_ON_VIN_PLUS ? "+" : "-");
+}
+
+// Called every loop() pass — non-blocking except the rare INA219 retry.
+void batteryService() {
+    unsigned long now = millis();
+
+    if (!inaOk) {
+        if (now - lastRetryMs >= INA_RETRY_MS) {
+            lastRetryMs = now;
+            initBattery();
+        }
+        return;
+    }
+
+    if (now - lastBatSampleMs >= BAT_SAMPLE_MS) {
+        updateBattery();
+        ibFiltered_mA += IB_FILTER_ALPHA * (lastCurrent_mA - ibFiltered_mA);
+    }
+
+    if (now - lastDispMs >= DISP_UPDATE_MS) {
+        lastDispMs = now;
+        updateDisplayPct(false);
+    }
+
+    // Config register lost (brown-out / glitch)? Rewrite it.
+    if (now - lastHealthMs >= INA_HEALTH_MS) {
+        lastHealthMs = now;
+        uint16_t c = 0;
+        if (inaRead(INA_REG_CONFIG, c) && c != inaCfgNow) {
+            Serial.printf("⚠️ INA219 config was 0x%04X — rewriting 0x%04X\n", c, inaCfgNow);
+            inaSetConfig(inaCfgNow);
+        }
+    }
+
+    maybeSaveBattery();
+
+    if (now - lastBatPrintMs >= BAT_PRINT_MS) {
+        lastBatPrintMs = now;
+        static const char* csName[] = { "DISCHARGING", "CHARGING", "FULL", "IDLE" };
+        Serial.printf("🔋 V:%.3fV I:%+.1fmA Rem:%.0f/%.0fmAh SoC:%d%%%s (raw %.1f%%) %s\n",
+                      lastBatteryV, -ibFiltered_mA, g_remain, g_cap, g_disp,
+                      (g_flags & FL_ANCHORED) ? "" : "~", batterySoCRaw(),
+                      csName[chargeState()]);
+#if INA_DEBUG
+        uint16_t c = 0;
+        inaRead(INA_REG_CONFIG, c);
+        Serial.printf("   INA raw: shunt %d (%+.2f mV) bus 0x%04X (%.3f V) cfg 0x%04X\n",
+                      lastShuntRaw, lastShuntRaw * 0.01f, lastBusRaw,
+                      (lastBusRaw >> 3) * 0.004f, c);
+#endif
+    }
 }
 
 // =============================================================================
@@ -483,7 +796,6 @@ void relayEnvelope(StaticJsonDocument<600>& doc, int hop, int rssi, const char* 
 // =============================================================================
 
 // 16-bit, never 0 (0 means "no msgId" and is dropped by every node).
-// 5 digits max instead of 10 — enough for dedupe within the 30 s cache.
 uint16_t newShortId() {
     uint16_t v;
     do { v = (uint16_t)(esp_random() & 0xFFFF); } while (v == 0);
@@ -497,17 +809,16 @@ void sendAck(const String& status, const char* fid, const char* bid,
     ack["UId"]     = MY_UID;
     ack["VId"]     = MY_VID;
     ack["msgId"]   = newShortId();
-    ack["replyTo"] = replyToMsgId;          // echoes the gateway's (now 16-bit) msgId
+    ack["replyTo"] = replyToMsgId;
     ack["hop"]     = DEFAULT_HOP_COUNT;
     ack["FId"]     = fid;
     ack["BId"]     = bid;
     ack["from"]    = MY_DID;
     ack["status"]  = status;
 
-    // Battery — take a fresh sample so V reflects post-pulse state.
+    // Battery — fresh sample so V reflects post-pulse state.
     updateBattery();
-    float soc = batterySoC();
-    ack["bat"] = (soc < 0) ? -1 : (int)lroundf(soc);
+    ack["bat"] = batteryPct();
     if (inaOk) {
         ack["ib"] = (int)lroundf(-ibFiltered_mA);   // reported: + charging, - discharging
         ack["cs"] = (int)chargeState();             // 0 dis, 1 chg, 2 full, 3 idle
@@ -558,8 +869,8 @@ void sendOtaAck(bool ok, const char* fid, const char* bid,
 
 // =============================================================================
 //  SECTION 12 — VALVE DRIVERS  (TB6612FNG, PWM + STBY hardwired HIGH)
-//  The pulse is metered: INA219 sampled every PULSE_SAMPLE_MS so the
-//  solenoid current is counted instead of falling between 1 s samples.
+//  The pulse is metered: INA219 switched to fast mode and sampled every
+//  PULSE_SAMPLE_MS, including a short tail while the boost recovers.
 // =============================================================================
 
 void actuateValve(uint8_t inPos, uint8_t inNeg,
@@ -571,15 +882,20 @@ void actuateValve(uint8_t inPos, uint8_t inNeg,
 
     Serial.printf("%s Valve %s\n", energizePositive ? "🔓 Opening" : "🔒 Closing", label);
 
-    updateBattery();   // close the idle interval right before the pulse
+    updateBattery();          // close the idle interval
+    inaUseFast();
+    updateBattery();          // fresh fast-mode baseline
+    shuntClipped = false;
 
     digitalWrite(inPos, energizePositive ? HIGH : LOW);
     digitalWrite(inNeg, energizePositive ? LOW  : HIGH);
 
     float peak_mA = 0.0f;
     unsigned long t0 = millis();
+    unsigned long lastS = t0;
     while (millis() - t0 < PULSE_MS) {
-        if (inaOk && (millis() - lastBatSampleMs) >= PULSE_SAMPLE_MS) {
+        if (inaOk && (millis() - lastS) >= PULSE_SAMPLE_MS) {
+            lastS = millis();
             updateBattery();
             if (lastCurrent_mA > peak_mA) peak_mA = lastCurrent_mA;
         }
@@ -589,8 +905,24 @@ void actuateValve(uint8_t inPos, uint8_t inNeg,
     digitalWrite(inPos, LOW);
     digitalWrite(inNeg, LOW);   // both LOW = TB6612 stop (outputs OFF)
 
-    updateBattery();   // close the pulse interval
-    if (inaOk) Serial.printf("⚡ Pulse peak %.0f mA | SoC %.1f%%\n", peak_mA, batterySoC());
+    // Tail: boost output caps recharge after the coil switches off.
+    t0 = millis();
+    while (millis() - t0 < POST_PULSE_MS) {
+        if (inaOk && (millis() - lastS) >= PULSE_SAMPLE_MS) {
+            lastS = millis();
+            updateBattery();
+        }
+        delay(1);
+    }
+    updateBattery();
+    inaUseSlow();
+
+    if (inaOk) {
+        Serial.printf("⚡ Pulse peak %.0f mA | SoC %d%%\n", peak_mA, g_disp);
+        if (shuntClipped)
+            Serial.println("⚠️ Pulse current exceeded the INA219 range (±320 mV) — "
+                           "use a smaller shunt or this pulse is under-counted");
+    }
 
     updateState(String(label), action);
     String status = "Valve " + String(label) + (energizePositive ? " Opened" : " Closed");
@@ -621,7 +953,7 @@ void runSelfOta(const char* url, const char* ssid, const char* pass,
         return;
     }
 
-    // OTA reboots on success — persist SoC so the count isn't lost.
+    // OTA reboots on success — persist the gauge so the count isn't lost.
     updateBattery();
     saveBattery();
 
@@ -834,10 +1166,11 @@ void setup() {
     loadValveState();
     randomSeed(esp_random());
 
-    Serial.println("\n🚀 Valve Node v4.3 (TB6612FNG + INA219) starting...");
+    Serial.println("\n🚀 Valve Node v4.4 (TB6612FNG + INA219 gauge) starting...");
     Serial.printf("📛 VId:%d  DId:%s\n", MY_VID, MY_DID);
 
     initBattery();
+    lastRetryMs = millis();
 
     LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
     if (!LoRa.begin(LORA_FREQ)) { Serial.println("❌ LoRa init failed!"); while (true); }
@@ -879,20 +1212,7 @@ void loop() {
         processPacket(dest, src, buf, len, rssi);
     }
 
-    // Battery Coulomb counting — non-blocking, once per second.
-    // Reported current is smoothed here (idle samples only, never the pulse).
-    if (inaOk && (millis() - lastBatSampleMs) >= BAT_SAMPLE_MS) {
-        updateBattery();
-        ibFiltered_mA += IB_FILTER_ALPHA * (lastCurrent_mA - ibFiltered_mA);
-        maybeSaveBattery();
-    }
-    if (inaOk && (millis() - lastBatPrintMs) >= BAT_PRINT_MS) {
-        lastBatPrintMs = millis();
-        static const char* csName[] = { "DISCHARGING", "CHARGING", "FULL", "IDLE" };
-        Serial.printf("🔋 V:%.3fV I:%+.1fmA Rem:%.0f/%.0fmAh SoC:%.1f%% %s\n",
-                      lastBatteryV, -ibFiltered_mA, remainingCapacityMAh,
-                      NOMINAL_CAPACITY_MAH, batterySoC(), csName[chargeState()]);
-    }
+    batteryService();   // 250 ms Coulomb counting, display %, health, save, print
 
     delay(5);
 }
