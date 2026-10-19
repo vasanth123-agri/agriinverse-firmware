@@ -1,5 +1,18 @@
 // =============================================================================
-//  AgriInverse — Solenoid Valve Node  (v4.4 — accurate INA219 battery gauge)
+//  AgriInverse — Solenoid Valve Node  (v4.5 — INA219 cell on VIN-)
+//
+//  CHANGES FROM v4.4
+//  -----------------
+//  1. CELL_ON_VIN_PLUS = 0: wiring is now the same as the AgriNode TX —
+//       INA219 VIN+ = supply bus (charger OUT + ESP32 3V3 + LoRa + TB6612
+//                     VCC + INA219 VCC + 12 V boost IN)
+//       INA219 VIN- = LiFePO4 cell + ONLY
+//  2. EMPTY_V raised 2.90 -> 3.00 V: the ESP32 and INA219 run straight
+//     from the cell (no regulator) and the INA219 needs VCC >= 3.0 V.
+//  3. GAUGE_VER bumped. Old saved gauge state (counted with the wrong
+//     sign) is discarded on first boot and the gauge reseeds from cell
+//     voltage — no manual NVS clear needed. The v4.3 "remMAh" key is
+//     deleted instead of migrated.
 //
 //  CHANGES FROM v4.3  (battery measurement only — radio/mesh/valve logic
 //  and the ack format are unchanged, so the gateway needs no update)
@@ -113,26 +126,31 @@ ValveState valveStateB = VS_UNKNOWN;
 // =============================================================================
 //  SECTION 3B — BATTERY MONITOR (INA219 direct driver + self-calibrating gauge)
 //
-//  Wiring (high-side, CELL_ON_VIN_PLUS = 1):
-//    battery+ -> INA219 VIN+ ; INA219 VIN- -> node supply bus
-//    (12V boost IN + 3.3V regulator IN + solar charger OUT).
-//    Battery- -> common GND.  INA219 VCC -> 3.3V, SDA 21, SCL 22.
-//  Everything except the cell itself must be on the VIN- side, otherwise
-//  charge current bypasses the shunt.
+//  Wiring (CELL_ON_VIN_PLUS = 0, same as the AgriNode TX):
+//    Solar charger OUT + ──┐
+//                          ├── supply bus ── INA219 VIN+ [shunt] VIN- ── fuse ── cell +
+//    ESP32 3V3, SX1278 VCC,│
+//    TB6612 VCC, INA219 VCC,
+//    12 V boost IN ────────┘
+//    Cell - ── common GND (charger -, boost -, ESP32, SX1278, TB6612, INA219)
+//    INA219 SDA -> GPIO 21, SCL -> GPIO 22
+//  The cell must be the ONLY thing on VIN-. If the charger connects
+//  straight to the cell, charge current bypasses the shunt and the
+//  reading never changes sign.
 //
-//  If your board is wired the other way (load/charger on VIN+, cell+ on
-//  VIN-, like the AgriNode TX), set CELL_ON_VIN_PLUS to 0. Nothing else
-//  changes — the current sign and the voltage correction follow.
+//  If your board is wired the other way (cell+ on VIN+, everything else
+//  on VIN-), set CELL_ON_VIN_PLUS to 1.
 //
 //  Check: at night with no valve activity the serial line must show
-//  DISCHARGING and I around -50..-90 mA. If it shows CHARGING, the
-//  CELL_ON_VIN_PLUS setting doesn't match the wiring.
+//  DISCHARGING and I around -50..-100 mA; in sun it must show CHARGING.
+//  If both show the same state, the charger is on the wrong side of
+//  the shunt. If they are swapped, flip CELL_ON_VIN_PLUS.
 // =============================================================================
 
 #define I2C_SDA 21
 #define I2C_SCL 22
 
-#define CELL_ON_VIN_PLUS   1        // 1 = cell on VIN+ (v4.3 wiring), 0 = cell on VIN-
+#define CELL_ON_VIN_PLUS   0        // 0 = cell on VIN- (this board), 1 = cell on VIN+
 #define INA_DEBUG          0        // 1 = print raw INA219 registers every 30 s
 
 const float R_SHUNT_OHM       = 0.100f;  // R100 on the usual breakout
@@ -167,7 +185,7 @@ uint16_t lastBusRaw     = 0;
 //     the real capacity is learned after one full -> empty run. ---
 const float NOMINAL_CAPACITY_MAH = 6000.0f;
 const float FULL_V               = 3.45f;  // full above this at low current
-const float EMPTY_V              = 2.90f;  // 0 % under (resting) load
+const float EMPTY_V              = 3.00f;  // 0 % under (resting) load — INA219 VCC min
 const float FULL_TAPER_MA        = 150.0f; // |I| below this at FULL_V = tapered
 const float FULL_HOLD_S          = 120.0f;
 const float EMPTY_HOLD_S         = 30.0f;
@@ -178,7 +196,7 @@ const float RESTING_CURRENT_MA   = 150.0f;
 const float OCV_MISMATCH_THRESHOLD_PERCENT = 25.0f;
 
 const char*    BAT_NVS_NS = "socdata";
-const uint32_t GAUGE_VER  = 0xBA770044UL;  // change -> gauge restarts clean
+const uint32_t GAUGE_VER  = 0xBA770045UL;  // change -> gauge restarts clean
 
 const unsigned long BAT_SAVE_INTERVAL_MS = 5UL * 60UL * 1000UL;
 const unsigned long BAT_SAMPLE_MS        = 250;     // idle sampling
@@ -469,7 +487,7 @@ void updateBattery() {
 // successful INA219 start.
 void gaugeRestore(float vBoot, float iBoot) {
     Preferences p;
-    p.begin(BAT_NVS_NS, true);
+    p.begin(BAT_NVS_NS, false);
     bool hasNew = (p.getUInt("gv", 0) == GAUGE_VER);
     if (hasNew) {
         g_remain = p.getFloat("rem", NAN);
@@ -477,13 +495,16 @@ void gaugeRestore(float vBoot, float iBoot) {
         g_dis    = p.getFloat("dis", 0.0f);
         g_flags  = p.getUInt ("flg", 0);
         g_disp   = p.getInt  ("disp", -1);
-    } else if (p.isKey("remMAh")) {                // migrate v4.3 state
-        g_remain = p.getFloat("remMAh", NAN);
+    } else {
+        // Older firmware's state was counted with the wrong current sign —
+        // discard it all (including v4.3's "remMAh") and reseed from OCV.
+        p.clear();
+        g_remain = NAN;
         g_cap    = NOMINAL_CAPACITY_MAH;
         g_dis    = 0.0f;
         g_flags  = 0;
         g_disp   = -1;
-        Serial.println("🔋 Migrated v4.3 battery state");
+        Serial.println("🔋 Old battery state discarded — reseeding from cell voltage");
     }
     p.end();
 
@@ -1166,7 +1187,7 @@ void setup() {
     loadValveState();
     randomSeed(esp_random());
 
-    Serial.println("\n🚀 Valve Node v4.4 (TB6612FNG + INA219 gauge) starting...");
+    Serial.println("\n🚀 Valve Node v4.5 (TB6612FNG + INA219 gauge, cell on VIN-) starting...");
     Serial.printf("📛 VId:%d  DId:%s\n", MY_VID, MY_DID);
 
     initBattery();
