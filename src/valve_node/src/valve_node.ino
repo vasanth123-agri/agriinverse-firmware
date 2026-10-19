@@ -135,7 +135,7 @@ const float OCV_MISMATCH_THRESHOLD_PERCENT = 25.0f;
 // Internal sign convention: + = discharging, - = charging.
 // If SoC climbs while the node is just idling on battery at night,
 // change this to +1.0.
-const float CURRENT_SIGN = +1.0f;
+const float CURRENT_SIGN = (-1.0f);
 
 const char* BAT_NVS_NS = "socdata";
 const float BAT_SAVE_THRESHOLD_PERCENT = 1.0f;
