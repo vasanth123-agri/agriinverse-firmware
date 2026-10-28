@@ -112,9 +112,9 @@
 // ============================================================
 
 #define DEVICE_ID  "Fert1"
-#define UNIT_ID    "32"
-#define BOARD_ID   "dufggcgirfighvcehvceh"
-#define FARM_ID    "cveghvjhvejhvjehvjehv"
+#define UNIT_ID    "4"
+#define BOARD_ID   "cmnwxuho400zlpk01onv6z3ow"
+#define FARM_ID    "cmnwxuhnu00zjpk01s3m7bb5h"
 
 // LoRa addressing — must match gateway definitions exactly
 #define ADDR_SELF  0x0A
