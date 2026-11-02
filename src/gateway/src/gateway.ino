@@ -1,5 +1,17 @@
 // =============================================================================
-//  AgriInverse — ESP32 LoRa/LTE Gateway  v5.1
+//  AgriInverse — ESP32 LoRa/LTE Gateway  v5.2
+//
+//  CHANGE FROM v5.1  (gateway only — valve node v4.5 stays as it is):
+//  relay_ack on relay/ack carries, along with the open/close status:
+//    "bat" SoC %, "bv" volts, "ib" mA (+chg/-dis), "cs" 0 dis/1 chg/2 full/3 idle
+//  bat always comes from the node; bv/ib/cs are absent if its INA219 is missing.
+//  FIX: "actuator" and "state" now come from the command being acked. They used
+//       to be guessed from the status text, so a "duplicate — already actioned"
+//       ack for Valve B open was published as Valve A close.
+//       A node rejection (wrong FId/BId) now gives state "rejected".
+//  FIX: msgId is now 31-bit. The node reads it with `doc["msgId"] | 0`, which
+//       turns values above INT_MAX into 0 and drops the command, so about half
+//       of all valve commands ended in no_ack.
 //
 //  CHANGE FROM v5.0:
 //  Valve relay_ack now forwards the node's battery status to AWS:
@@ -217,6 +229,8 @@ struct PendingValve {
     char     payload[256]= {};
     uint16_t payloadLen  = 0;
     char     deviceId[32]= {};
+    char     valve[4]    = {};     // "A" / "B" — reported in relay_ack
+    char     cmd[8]      = {};     // "open" / "close" — reported in relay_ack
     char     ackJson[320]= {};
 };
 
@@ -386,6 +400,14 @@ void clearError() {
     dState.errorCode = ERR_NONE;
 }
 
+// Nodes reject msgId 0. Kept to 31 bits so firmware that still reads ids with
+// `doc["msgId"] | 0` (values above INT_MAX become 0) is not affected.
+uint32_t newMsgId() {
+    uint32_t v;
+    do { v = esp_random() & 0x7FFFFFFFUL; } while (v == 0);
+    return v;
+}
+
 // AWS/API Gateway may serialize VId as a JSON number (7) or a JSON string
 // ("7") depending on how the payload was built. Parse both forms explicitly
 // instead of relying on ArduinoJson's `| 0` numeric coercion, which doesn't
@@ -541,7 +563,7 @@ void enqueueValveCommand(uint8_t vId, const String& device, const String& valve,
         return;
     }
 
-    uint32_t msgId = (uint32_t)esp_random();
+    uint32_t msgId = newMsgId();
 
     StaticJsonDocument<256> doc;
     doc["type"]    = "command_broadcast";
@@ -578,6 +600,11 @@ void enqueueValveCommand(uint8_t vId, const String& device, const String& valve,
         memset(p.ackJson, 0, sizeof(p.ackJson));
         memcpy(p.payload, buf, n);
         strlcpy(p.deviceId, device.c_str(), sizeof(p.deviceId));
+        // Same normalising the node applies, so these match what it executed.
+        String valveNorm = valve; valveNorm.toUpperCase();
+        String cmdNorm   = cmd;   cmdNorm.toLowerCase();
+        strlcpy(p.valve, valveNorm.c_str(), sizeof(p.valve));
+        strlcpy(p.cmd,   cmdNorm.c_str(),   sizeof(p.cmd));
 
         Serial.printf("⏱ Waiting for ACK — VId:%d msgId:%lu — timeout in %lu s\n",
                       vId, (unsigned long)msgId, CMD_RETRY_MS / 1000);
@@ -730,7 +757,7 @@ void handleOtaCommandValveBranch(DynamicJsonDocument& doc) {
         return;
     }
 
-    uint32_t msgId  = (uint32_t)esp_random();
+    uint32_t msgId  = newMsgId();
     const char* fid = doc["FId"] | "";
     const char* bid = doc["BId"] | "";
 
@@ -794,7 +821,7 @@ void handleOtaCommandMotorBranch(DynamicJsonDocument& doc) {
         return;
     }
 
-    uint32_t msgId  = (uint32_t)esp_random();
+    uint32_t msgId  = newMsgId();
     const char* fid = doc["FId"] | "";
     const char* bid = doc["BId"] | "";
 
@@ -1355,7 +1382,7 @@ void handleLoRaAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
 void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
     const char* type = loraDoc["type"] | "";
     int vId          = loraDoc["VId"]     | -1;
-    uint32_t replyTo = loraDoc["replyTo"] | 0;
+    uint32_t replyTo = loraDoc["replyTo"].as<uint32_t>();
 
     if (vId < 0 || vId > MAX_VALVES) {
         Serial.printf("⏭ %s: bad/missing VId — dropping\n", type);
@@ -1382,7 +1409,7 @@ void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
         else                      diag.cmdAckAttempt3++;
         clearError();
 
-        StaticJsonDocument<320> mqttDoc;
+        StaticJsonDocument<384> mqttDoc;
         mqttDoc["type"]   = "relay_ack";
         mqttDoc["UId"]    = DEVICE_ID;
         mqttDoc["VId"]    = vId;
@@ -1390,12 +1417,16 @@ void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
 
         const char* rawStatus = loraDoc["status"] | "";
         mqttDoc["status"]   = rawStatus;
-        mqttDoc["actuator"] = strcasestr(rawStatus, " B ") ? "Valve B" : "Valve A";
-        mqttDoc["state"]    = strcasestr(rawStatus, "open") ? "open" : "close";
+        // From the command this ack answers, not the status text: a retry can
+        // be answered with "duplicate — already actioned", which names neither.
+        char actuator[12];
+        snprintf(actuator, sizeof(actuator), "Valve %s", p.valve);
+        mqttDoc["actuator"] = (char*)actuator;   // char* so the doc keeps a copy
+        mqttDoc["state"]    = strcasestr(rawStatus, "rejected") ? "rejected" : p.cmd;
         if (loraDoc.containsKey("FId")) mqttDoc["FId"] = loraDoc["FId"];
         if (loraDoc.containsKey("BId")) mqttDoc["BId"] = loraDoc["BId"];
 
-        // v5.1 — battery status from valve node v4.1+ (forwarded as-is):
+        // Battery status from the valve node v4.5 (forwarded as-is):
         //   bat = SoC %  (-1 = INA219 missing)
         //   bv  = battery volts
         //   ib  = battery current mA (+ charging, - discharging)
@@ -1405,17 +1436,11 @@ void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
         if (loraDoc.containsKey("ib"))  mqttDoc["ib"]  = loraDoc["ib"];
         if (loraDoc.containsKey("cs"))  mqttDoc["cs"]  = loraDoc["cs"];
 
-        size_t ackLen = serializeJson(mqttDoc, p.ackJson, sizeof(p.ackJson));
-        if (ackLen >= sizeof(((MqttPubReq*)0)->payload)) {
-            // Would be cut off by the 256-byte MQTT payload buffer — drop
-            // the optional fields rather than publish broken JSON.
-            mqttDoc.remove("bv");
-            mqttDoc.remove("ib");
-            serializeJson(mqttDoc, p.ackJson, sizeof(p.ackJson));
-            Serial.printf("⚠️ relay_ack %u B — dropped bv/ib to fit\n", (unsigned)ackLen);
-        }
+        serializeJson(mqttDoc, p.ackJson, sizeof(p.ackJson));
         Serial.printf("✅ ACK matched — VId:%d msgId:%lu attempt:%d/3\n",
                       vId, (unsigned long)replyTo, attemptNum);
+        if (!loraDoc.containsKey("bv"))
+            Serial.printf("⚠️ VId:%d sent no battery readings — check its INA219\n", vId);
         publishValveAck(idx);
         return;
     }
@@ -1733,7 +1758,7 @@ void displayTask(void* param) {
 // =============================================================================
 
 void printDiagnostics() {
-    Serial.println("\n══════════ GATEWAY v5.1 DIAGNOSTICS ══════════");
+    Serial.println("\n══════════ GATEWAY v5.2 DIAGNOSTICS ══════════");
     Serial.printf("  LoRa RX total:     %lu\n", diag.rxTotal);
     Serial.printf("  RX dest drops:     %lu\n", diag.rxDroppedDest);
     Serial.printf("  RX JSON drops:     %lu\n", diag.rxDroppedJson);
@@ -1812,7 +1837,7 @@ void setup() {
         display.setCursor(20, 20);
         display.println("AgriInverse GW");
         display.setCursor(30, 35);
-        display.println("v5.1 starting");
+        display.println("v5.2 starting");
         display.display();
         Serial.println("✅ OLED ready");
     } else {
@@ -1850,7 +1875,7 @@ void setup() {
     xTaskCreatePinnedToCore(displayTask, "Display", 4096,  NULL, 1, &displayTaskHandle, 1);
     xTaskCreatePinnedToCore(otaTask,     "OTA",     8192,  NULL, 1, &otaTaskHandle,     1);
 
-    Serial.println("✅ AgriInverse gateway v5.1 started");
+    Serial.println("✅ AgriInverse gateway v5.2 started");
     vTaskSuspend(NULL);
 }
 
