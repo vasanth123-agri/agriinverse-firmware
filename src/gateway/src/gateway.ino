@@ -1,5 +1,14 @@
 // =============================================================================
-//  AgriInverse — ESP32 LoRa/LTE Gateway  v5.2
+//  AgriInverse — ESP32 LoRa/LTE Gateway  v5.3
+//
+//  CHANGE FROM v5.2  (gateway only — valve node v4.5 stays as it is):
+//  OLED now shows the retransmission state on its own line:
+//    "V7 TRY 2/3 45s +2"  attempt, seconds left, and how many others are waiting
+//    "V7 ACK 2/3"         ack received on that attempt (shown for 10 s)
+//    "V7 NO ACK"          all 3 attempts failed (shown for 10 s)
+//    "RETRY:--"           nothing waiting
+//  Covers valve, motor and OTA commands. When several are waiting, the one
+//  whose timer ends first is shown. Radio, retry and MQTT logic are unchanged.
 //
 //  CHANGE FROM v5.1  (gateway only — valve node v4.5 stays as it is):
 //  relay_ack on relay/ack carries, along with the open/close status:
@@ -45,11 +54,11 @@
 //
 //  OLED LAYOUT (128×64, SSD1306):
 //  ┌──────────────────────────────┐
-//  │ [LoRa▂▄▆█]  [GSM ▂▄▆█]     │  row 0  — signal bars
-//  │ LoRa:ACTIVE   GSM:CONNECTED  │  row 18 — status labels
-//  │ MQTT: CONNECTED              │  row 30 — MQTT status
-//  │ CMD:  V7 A open               │  row 42 — last command
-//  │ ERR:  --                     │  row 54 — error code
+//  │ LoRa [▂▄▆█]    GSM [▂▄▆█]    │  row 0  — signal bars
+//  │ LORA:OK                      │  row 16 — radio status
+//  │ CMD:V7 A open                │  row 28 — last command
+//  │ V7 TRY 2/3 45s +2            │  row 40 — retransmission state
+//  │ ERR:--           -82dBm      │  row 52 — error code + RSSI
 //  └──────────────────────────────┘
 //
 //  ERROR CODES:
@@ -308,6 +317,11 @@ static OtaPending otaPending;
 static volatile bool     mqttOnline   = false;
 static volatile uint32_t lastLoRaRxMs = 0;
 
+// Last retransmission result shown on the OLED once nothing is waiting.
+#define RETRY_RESULT_SHOW_MS 10000UL
+static char     retryResult[22]  = "";
+static uint32_t retryResultUntil = 0;
+
 // =============================================================================
 //  SECTION 11 — DIAGNOSTICS
 // =============================================================================
@@ -370,6 +384,7 @@ void  publishValveNoAck(int idx);
 void  valveRetryTick();
 void  setError(uint16_t code);
 void  clearError();
+void  setRetryResult(const char* text);
 void  printDiagnostics();
 int   parseVId(DynamicJsonDocument& doc);   // accepts VId as JSON number or string
 
@@ -385,6 +400,7 @@ void  handleLoRaOtaAck(DynamicJsonDocument& loraDoc);   // non-mesh (motor/appli
 void  oledDrawSignalBars(int x, int y, int bars, int maxBars);
 int   rssiToLoRaBars(int rssi);
 int   csmToGsmBars(int csq);
+void  buildRetryLine(char* line, size_t size);
 void  oledRender();
 
 // =============================================================================
@@ -398,6 +414,11 @@ void setError(uint16_t code) {
 
 void clearError() {
     dState.errorCode = ERR_NONE;
+}
+
+void setRetryResult(const char* text) {
+    strlcpy(retryResult, text, sizeof(retryResult));
+    retryResultUntil = millis() + RETRY_RESULT_SHOW_MS;
 }
 
 // Nodes reject msgId 0. Kept to 31 bits so firmware that still reads ids with
@@ -1280,6 +1301,7 @@ void publishNoAck(int idx) {
                   p.deviceId, p.actuator, CMD_MAX_RETRIES + 1, req.payload);
 
     setError(ERR_NO_ACK);
+    setRetryResult("MOTOR NO ACK");
     diag.cmdNoAck++;
 
     if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -1327,6 +1349,9 @@ void publishValveNoAck(int idx) {
                   p.vId, p.deviceId, CMD_MAX_RETRIES + 1, req.payload);
 
     setError(ERR_NO_ACK);
+    char result[22];
+    snprintf(result, sizeof(result), "V%d NO ACK", p.vId);
+    setRetryResult(result);
     diag.cmdNoAck++;
     if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
         diag.mqttPubFail++;
@@ -1357,6 +1382,10 @@ void handleLoRaAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
     else                      diag.cmdAckAttempt3++;
 
     clearError();
+
+    char result[22];
+    snprintf(result, sizeof(result), "MOTOR ACK %d/%d", attemptNum, CMD_MAX_RETRIES + 1);
+    setRetryResult(result);
 
     StaticJsonDocument<320> mqttDoc;
     mqttDoc["type"]   = "relay_ack";
@@ -1409,6 +1438,10 @@ void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
         else                      diag.cmdAckAttempt3++;
         clearError();
 
+        char result[22];
+        snprintf(result, sizeof(result), "V%d ACK %d/%d", vId, attemptNum, CMD_MAX_RETRIES + 1);
+        setRetryResult(result);
+
         StaticJsonDocument<384> mqttDoc;
         mqttDoc["type"]   = "relay_ack";
         mqttDoc["UId"]    = DEVICE_ID;
@@ -1459,6 +1492,7 @@ void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
         const char* detail = loraDoc["detail"] | "";
         Serial.printf("✅ OTA-ACK matched — VId:%d status:%s\n", vId, status);
         publishOtaAck(ok, otaPending.deviceId, otaPending.nodeType, detail);
+        setRetryResult(ok ? "OTA ACK" : "OTA FAILED");
         otaPending.active = false;
         return;
     }
@@ -1619,6 +1653,7 @@ void appTask(void* param) {
             } else {
                 Serial.printf("\n❌ OTA — all 3 attempts exhausted for %s\n", otaPending.deviceId);
                 publishOtaAck(false, otaPending.deviceId, otaPending.nodeType, "no ack after 3 attempts");
+                setRetryResult("OTA NO ACK");
                 otaPending.active = false;
             }
         }
@@ -1695,6 +1730,53 @@ void oledDrawSignalBars(int x, int y, int barsFilled, int maxBars = 4) {
     }
 }
 
+// Builds the retransmission line. Priority: a running countdown, then the
+// last result for RETRY_RESULT_SHOW_MS, then "RETRY:--".
+void buildRetryLine(char* line, size_t size) {
+    uint32_t now = millis();
+    int32_t  bestLeft = INT32_MAX;
+    uint8_t  attempt = 0;
+    int      waiting = 0;
+    char     who[8] = "";
+
+    auto consider = [&](const char* name, uint8_t retryCount, uint32_t nextRetryMs) {
+        int32_t left = (int32_t)(nextRetryMs - now);
+        waiting++;
+        if (left < bestLeft) {
+            bestLeft = left;
+            attempt  = retryCount + 1;
+            strlcpy(who, name, sizeof(who));
+        }
+    };
+
+    for (int i = 0; i < MAX_VALVES; i++) {
+        if (!pendingValve[i].active) continue;
+        char name[8];
+        snprintf(name, sizeof(name), "V%d", i + 1);
+        consider(name, pendingValve[i].retryCount, pendingValve[i].nextRetryMs);
+    }
+    if (pendingCmd[PENDING_MOTOR_IDX].active) {
+        consider("MOTOR", pendingCmd[PENDING_MOTOR_IDX].retryCount,
+                 pendingCmd[PENDING_MOTOR_IDX].nextRetryMs);
+    }
+    if (otaPending.active) {
+        consider("OTA", otaPending.retryCount, otaPending.nextRetryMs);
+    }
+
+    if (waiting > 0) {
+        long seconds = (bestLeft <= 0) ? 0 : (bestLeft + 999) / 1000;
+        int n = snprintf(line, size, "%s TRY %u/%d %lds",
+                         who, attempt, CMD_MAX_RETRIES + 1, seconds);
+        if (waiting > 1 && n > 0 && (size_t)n < size) {
+            snprintf(line + n, size - n, " +%d", waiting - 1);
+        }
+    } else if (retryResult[0] && (int32_t)(retryResultUntil - now) > 0) {
+        strlcpy(line, retryResult, size);
+    } else {
+        strlcpy(line, "RETRY:--", size);
+    }
+}
+
 // =============================================================================
 //  SECTION 28 — OLED RENDER
 // =============================================================================
@@ -1722,11 +1804,16 @@ void oledRender() {
     //display.print("MQTT:");
     //display.print(dState.mqttOnline ? "OK" : "FAIL");
 
-    display.setCursor(0, 32);
+    display.setCursor(0, 28);
     display.print("CMD:");
     display.print((const char*)dState.lastCmd);
 
-    display.setCursor(0, 48);
+    char retryLine[22];
+    buildRetryLine(retryLine, sizeof(retryLine));
+    display.setCursor(0, 40);
+    display.print(retryLine);
+
+    display.setCursor(0, 52);
     display.print("ERR:");
     uint16_t err = dState.errorCode;
     if (err == ERR_NONE)
@@ -1734,7 +1821,7 @@ void oledRender() {
     else
         display.print(err);
 
-    display.setCursor(80, 48);
+    display.setCursor(80, 52);
     char rssiBuf[12];
     snprintf(rssiBuf, sizeof(rssiBuf), "%ddBm", dState.loraRSSI);
     display.print(rssiBuf);
@@ -1758,7 +1845,7 @@ void displayTask(void* param) {
 // =============================================================================
 
 void printDiagnostics() {
-    Serial.println("\n══════════ GATEWAY v5.2 DIAGNOSTICS ══════════");
+    Serial.println("\n══════════ GATEWAY v5.3 DIAGNOSTICS ══════════");
     Serial.printf("  LoRa RX total:     %lu\n", diag.rxTotal);
     Serial.printf("  RX dest drops:     %lu\n", diag.rxDroppedDest);
     Serial.printf("  RX JSON drops:     %lu\n", diag.rxDroppedJson);
@@ -1837,7 +1924,7 @@ void setup() {
         display.setCursor(20, 20);
         display.println("AgriInverse GW");
         display.setCursor(30, 35);
-        display.println("v5.2 starting");
+        display.println("v5.3 starting");
         display.display();
         Serial.println("✅ OLED ready");
     } else {
@@ -1875,7 +1962,7 @@ void setup() {
     xTaskCreatePinnedToCore(displayTask, "Display", 4096,  NULL, 1, &displayTaskHandle, 1);
     xTaskCreatePinnedToCore(otaTask,     "OTA",     8192,  NULL, 1, &otaTaskHandle,     1);
 
-    Serial.println("✅ AgriInverse gateway v5.2 started");
+    Serial.println("✅ AgriInverse gateway v5.3 started");
     vTaskSuspend(NULL);
 }
 
