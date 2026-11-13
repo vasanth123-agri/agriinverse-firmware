@@ -1,71 +1,37 @@
 // =============================================================================
-//  AgriInverse — ESP32 LoRa/LTE Gateway  v5.3
+//  AgriInverse — ESP32 LoRa/LTE Gateway  v6.2  (GSM, smart mesh, same formats)
 //
-//  CHANGE FROM v5.2  (gateway only — valve node v4.5 stays as it is):
-//  OLED now shows the retransmission state on its own line:
-//    "V7 TRY 2/3 45s +2"  attempt, seconds left, and how many others are waiting
-//    "V7 ACK 2/3"         ack received on that attempt (shown for 10 s)
-//    "V7 NO ACK"          all 3 attempts failed (shown for 10 s)
-//    "RETRY:--"           nothing waiting
-//  Covers valve, motor and OTA commands. When several are waiting, the one
-//  whose timer ends first is shown. Radio, retry and MQTT logic are unchanged.
+//  Same as gateway v6.1 (WiFi), but AWS IoT is reached through the A7670
+//  LTE modem, as in gateway v5.3. Works with valve node v4.6 (also talks to
+//  v4.5 nodes — packets unchanged).
 //
-//  CHANGE FROM v5.1  (gateway only — valve node v4.5 stays as it is):
-//  relay_ack on relay/ack carries, along with the open/close status:
-//    "bat" SoC %, "bv" volts, "ib" mA (+chg/-dis), "cs" 0 dis/1 chg/2 full/3 idle
-//  bat always comes from the node; bv/ib/cs are absent if its INA219 is missing.
-//  FIX: "actuator" and "state" now come from the command being acked. They used
-//       to be guessed from the status text, so a "duplicate — already actioned"
-//       ack for Valve B open was published as Valve A close.
-//       A node rejection (wrong FId/BId) now gives state "rejected".
-//  FIX: msgId is now 31-bit. The node reads it with `doc["msgId"] | 0`, which
-//       turns values above INT_MAX into 0 and drops the command, so about half
-//       of all valve commands ended in no_ack.
+//  NO FORMAT CHANGES. LoRa command / OTA packets and the relay_ack, no_ack,
+//  ota_ack, ota_no_ack and power messages to AWS have the same fields as
+//  v5.3 / v6.0 / v6.1.
 //
-//  CHANGE FROM v5.0:
-//  Valve relay_ack now forwards the node's battery status to AWS:
-//    "bat" SoC %, "bv" volts, "ib" mA (+chg/-dis), "cs" 0 dis/1 chg/2 full/3 idle
-//  Fields are only added when the node sends them (valve node v4.1+), so
-//  older nodes still produce the same relay_ack as before.
+//  WHAT CAME FROM WHERE
+//  --------------------
+//  From v5.3 (LTE): modem power-up on PWKEY, network + GPRS + NTP, MQTT over
+//    the modem with the AWS certificates, 10-min LTE watchdog (modem restart),
+//    GSM signal bars on the OLED, gateway self-OTA by joining wifi_ssid /
+//    wifi_pass from the OTA payload.
+//  From v6.1 (smart mesh): one valve-mesh job at a time, fixed-address
+//    traffic held while a mesh job is in flight, ≈22 s retry timeout,
+//    app-resend filter, valve OTA "accepted" handling, late OTA-failure
+//    reports, 384 B MQTT payloads, OLED retry line "V9 TRY 2/3 14s +3".
 //
-//  CHANGE FROM v4.5:
-//  Valve nodes (VId 1..15, randomly placed) are now reached via flood-relay
-//  mesh instead of a single fixed LoRa address. All valve command / OTA /
-//  ack / ota_ack traffic transmits to BROADCAST_ID (0x00); each valve node
-//  decides locally whether to consume (VId match) or relay (hop--, jitter,
-//  rebroadcast) a packet. See valve_node_final.ino for the node side.
-//
-//  Motor/appliances/sensor/fertigation nodes are UNCHANGED — still single
-//  fixed LoRa address, single in-flight slot, same as v4.5.
-//
-//  RADIO ARCHITECTURE:
-//  Single loraTask owns radio exclusively (Core 0, pri 3).
-//  TX → blocking endPacket() → immediate LoRa.receive() → no race condition.
-//
-//  VALVE COMMAND FLOW (mesh):
-//  1. MQTT cmd received (must include VId 1-15) → build broadcast packet with
-//     fresh msgId + hop=MESH_HOP_COUNT → TX to BROADCAST_ID → arm pendingValve[VId]
-//  2. ACK (VId+replyTo==msgId) within 90s? → YES: publish relay_ack, done
-//  3. No ACK → retry SAME msgId, attempt 2/3
-//  4. ACK?    → YES: publish relay_ack, done
-//  5. No ACK → retry SAME msgId, attempt 3/3
-//  6. ACK?    → YES: publish relay_ack, done
-//  7. No ACK → publish no_ack, done
+//  Required library: TinyGSM fork with A7670 MQTT support (the one v5.3
+//  used — modem.mqtt_connect / mqtt_publish / mqtt_handle).
+//  Set the APN in SECTION 3.
 //
 //  OLED LAYOUT (128×64, SSD1306):
 //  ┌──────────────────────────────┐
 //  │ LoRa [▂▄▆█]    GSM [▂▄▆█]    │  row 0  — signal bars
-//  │ LORA:OK                      │  row 16 — radio status
+//  │ LORA:OK  MQTT:OK             │  row 16 — radio / cloud status
 //  │ CMD:V7 A open                │  row 28 — last command
-//  │ V7 TRY 2/3 45s +2            │  row 40 — retransmission state
-//  │ ERR:--           -82dBm      │  row 52 — error code + RSSI
+//  │ V7 TRY 2/3 14s +2            │  row 40 — retransmission state
+//  │ ERR:--           -82dBm      │  row 52 — error code + LoRa RSSI
 //  └──────────────────────────────┘
-//
-//  ERROR CODES:
-//  100 — No ACK from node after 3 attempts
-//  101 — LoRa radio reinit / hardware failure
-//  102 — Received invalid/non-JSON packet
-//  103 — JSON parse failure
 // =============================================================================
 
 #define TINY_GSM_MODEM_A7670
@@ -81,12 +47,13 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <WiFi.h>
+#include <WiFi.h>               // gateway self-OTA only
 #include <WiFiClientSecure.h>
 #include <HTTPUpdate.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #include "certificate.h"
 #include "privatekey.h"
@@ -107,13 +74,8 @@
 #define LORA_DIO0    26
 #define LORA_FREQ    433E6
 
-#define NODE3_ID     0xBB
+#define NODE3_ID     0xBB   // this gateway
 #define NODE6_ID     0xD2   // Motor relay node
-#define NODE7_ID     0xD3   // Appliances node
-#define NODE8_ID     0xD4   // Sensor node
-#define NODE9_ID     0xD5   // Fertigation node
-// NOTE: NODE5_ID (fixed valve address 0xD1) is retired — valves are now
-// addressed by VId over the mesh (see SECTION 4).
 
 // =============================================================================
 //  SECTION 2 — OLED
@@ -130,7 +92,7 @@ Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
 static bool oledOK = false;
 
 // =============================================================================
-//  SECTION 3 — NETWORK & BROKER
+//  SECTION 3 — LTE NETWORK & BROKER
 // =============================================================================
 
 const char apn[]      = "iot.com";
@@ -147,8 +109,10 @@ const char publish_topic[]       = "relay/ack";
 const char publish_power_topic[] = "relay/power";
 const char publish_ota_topic[]   = "relay/ota_ack";
 
+#define LTE_WATCHDOG_MS     (10UL * 60 * 1000)   // no MQTT this long → restart modem
+
 // =============================================================================
-//  SECTION 4 — LoRa RF PARAMETERS
+//  SECTION 4 — LoRa RF + MESH PARAMETERS  (timing must match valve node v4.6)
 // =============================================================================
 
 #define LORA_SF        7
@@ -157,10 +121,24 @@ const char publish_ota_topic[]   = "relay/ota_ack";
 #define LORA_SYNCWORD  0xAB
 #define LORA_TXPOWER   20
 #define LORA_PREAMBLE  8
+#define LORA_MAX_BODY  253
+#define RELAY_HEADROOM 16
 
-#define BROADCAST_ID    0xD1     // all valve-mesh traffic (cmd/ota/ack/ota_ack)
-#define MESH_HOP_COUNT  6        // raise if nodes log "hop exhausted"
-#define MAX_VALVES      15       // VId 1..15 → index 0..14
+#define BROADCAST_ID    0xD1     // all valve-mesh traffic
+#define MAX_VALVES      15
+#define MOTOR_MESH_VID  0
+
+// Hop budget put in every command (same field as before). Lower it to
+// (relays your farthest node needs) + 1 for less traffic and faster retries.
+#define MESH_HOP_COUNT  6
+
+#define MESH_ATTEMPTS        3
+#define FLOOD_LEVEL_MS       1550   // node: FLOOD_SLOTS × FLOOD_SLOT_MS + jitter
+#define ACK_PRE_DELAY_MS     1500   // node: ACK_PRE_DELAY_MS
+#define NODE_WORK_MS         900    // safe delay + pulse + tail + battery read
+#define MESH_MARGIN_MS       1500
+#define MESH_MIN_TIMEOUT_MS  12000  // > node duplicate window (10 s)
+#define MESH_GUARD_MS        1500   // quiet time between jobs
 
 // =============================================================================
 //  SECTION 5 — QUEUE DEPTHS & TIMEOUTS
@@ -169,26 +147,27 @@ const char publish_ota_topic[]   = "relay/ota_ack";
 #define RX_QUEUE_DEPTH       16
 #define TX_HI_QUEUE_DEPTH    8
 #define TX_LO_QUEUE_DEPTH    16
+#define MESH_TX_QUEUE_DEPTH  4
+#define MESH_JOB_QUEUE_DEPTH 24
 #define MQTT_PUB_QUEUE_DEPTH 8
 
 #define MQTT_RETRY_MIN_MS   10000UL
 #define MQTT_RETRY_MAX_MS   60000UL
 #define LORA_WATCHDOG_MS    (5UL * 60 * 1000)
-#define LTE_WATCHDOG_MS     (10UL * 60 * 1000)
 
-#define CMD_MAX_RETRIES  2
+#define CMD_MAX_RETRIES  2          // motor (fixed address)
 #define CMD_RETRY_MS     90000UL
-#define MAX_MQTT_FAILURES  5   // consecutive publish failures before forcing a reconnect
+#define MAX_MQTT_FAILURES  5
 
 // =============================================================================
 //  SECTION 6 — ERROR CODES
 // =============================================================================
 
 #define ERR_NONE          0
-#define ERR_NO_ACK      100   // No ACK from node after 3 attempts
-#define ERR_LORA_REINIT 101   // LoRa radio reinit / hardware failure
-#define ERR_INVALID_PKT 102   // Received non-JSON / malformed packet
-#define ERR_JSON_PARSE  103   // JSON deserialize failure
+#define ERR_NO_ACK      100
+#define ERR_LORA_REINIT 101
+#define ERR_INVALID_PKT 102
+#define ERR_JSON_PARSE  103
 
 // =============================================================================
 //  SECTION 7 — STRUCTS
@@ -211,11 +190,11 @@ struct LoRaTxPacket {
 };
 
 struct MqttPubReq {
-    char topic[128];
-    char payload[256];
+    char topic[64];
+    char payload[384];
 };
 
-// Motor keeps the original single-slot pending model — unchanged from v4.5.
+// Motor commands keep the single-slot model.
 struct PendingCmd {
     bool     active      = false;
     uint8_t  destNode    = 0;
@@ -225,43 +204,44 @@ struct PendingCmd {
     uint16_t payloadLen  = 0;
     char     deviceId[32]= {};
     char     actuator[16]= {};
-    char     ackJson[320]= {};
+    char     ackJson[384]= {};
 };
 
-// NEW — one slot per valve VId (1..15), mesh-routed via BROADCAST_ID.
-struct PendingValve {
-    bool     active      = false;
-    uint8_t  vId         = 0;
-    uint8_t  retryCount  = 0;
-    uint32_t nextRetryMs = 0;
-    uint32_t msgId       = 0;      // must match ACK's "replyTo"
-    char     payload[256]= {};
-    uint16_t payloadLen  = 0;
-    char     deviceId[32]= {};
-    char     valve[4]    = {};     // "A" / "B" — reported in relay_ack
-    char     cmd[8]      = {};     // "open" / "close" — reported in relay_ack
-    char     ackJson[320]= {};
+// One job on the 0xD1 mesh. The packet is built once (same JSON as v6.0)
+// and the same bytes are sent on every attempt.
+enum MeshKind : uint8_t { MK_CMD = 0, MK_OTA = 1 };
+struct MeshJob {
+    uint8_t  kind;
+    uint8_t  vId;            // 1..15, or 0 with motorMesh for motor OTA
+    bool     motorMesh;
+    uint32_t msgId;
+    char     deviceId[32];   // CMD: "device" from AWS; OTA: UId
+    char     valve[4];       // normalised, for relay_ack
+    char     cmd[8];
+    char     nodeType[24];   // OTA: "valve node" / "motor node"
+    uint16_t payloadLen;
+    char     payload[256];
 };
 
-// OTA — extended with vId/msgId for valve-mesh targets; destNode still used
-// for motor/appliances/sensor/fertigation (fixed-address) targets.
-struct OtaPending {
-    bool     active      = false;
-    uint8_t  destNode    = 0;    // unused now — kept for possible future fixed-address targets
-    uint8_t  vId         = 0;    // 1..15 for valve mesh target; 0 + motorMesh=true for motor
-    bool     motorMesh   = false;
-    uint32_t msgId       = 0;    // matched against ack/ota_ack "replyTo"
-    uint8_t  retryCount  = 0;
-    uint32_t nextRetryMs = 0;
-    char     payload[256]= {};
-    uint16_t payloadLen  = 0;
-    char     deviceId[32]= {};
-    char     nodeType[24]= {};   // "valve node" / "motor node"
-    char     ackJson[320]= {};
+// Identity of a queued / in-flight job, used to ignore the app's resends.
+// Defined here (not next to its functions) so Arduino's auto-generated
+// function prototypes can see it.
+struct JobKey {
+    bool    used;
+    uint8_t kind;
+    uint8_t vId;
+    bool    motorMesh;
+    char    valve[4];
+    char    cmd[8];
 };
 
-// Job handed from mqttTask -> otaTask so a slow/blocking self-OTA download
-// never stalls modem.mqtt_handle() (which must be pumped every 10ms or MQTT drops).
+struct MeshTxn {
+    bool     active   = false;
+    MeshJob  job;
+    uint8_t  attempt  = 0;
+    uint32_t deadline = 0;
+};
+
 struct SelfOtaJob {
     char deviceType[24] = {};
     char uid[32]        = {};
@@ -271,16 +251,16 @@ struct SelfOtaJob {
 };
 
 // =============================================================================
-//  SECTION 8 — DISPLAY STATE  (written by any task, read by displayTask)
+//  SECTION 8 — DISPLAY STATE
 // =============================================================================
 
 struct DisplayState {
     bool     loraActive   = false;
     bool     mqttOnline   = false;
     int      loraRSSI     = -120;
-    int      gsmRSSI      = 0;       // CSQ value 0–31 from modem
+    int      gsmRSSI      = 0;       // CSQ 0–31 from the modem
     uint16_t errorCode    = ERR_NONE;
-    char     lastCmd[32]  = "--";    // e.g. "V7 A open"
+    char     lastCmd[32]  = "--";
 };
 static volatile DisplayState dState;
 
@@ -291,8 +271,10 @@ static volatile DisplayState dState;
 static QueueHandle_t  rxQueue;
 static QueueHandle_t  txHiQueue;
 static QueueHandle_t  txLoQueue;
+static QueueHandle_t  meshTxQueue;
+static QueueHandle_t  meshJobQueue;
 static QueueHandle_t  mqttPubQueue;
-static QueueHandle_t  otaJobQueue;   // hands OTA work off mqttTask onto its own low-priority task
+static QueueHandle_t  otaJobQueue;
 
 static TaskHandle_t   loraTaskHandle    = nullptr;
 static TaskHandle_t   mqttTaskHandle    = nullptr;
@@ -301,14 +283,11 @@ static TaskHandle_t   displayTaskHandle = nullptr;
 static TaskHandle_t   otaTaskHandle     = nullptr;
 
 #define PENDING_MOTOR_IDX  1
-static PendingCmd pendingCmd[2];              // index 1 = motor (index 0 retired)
-static PendingValve pendingValve[MAX_VALVES]; // index 0..14 = VId 1..15
+static PendingCmd pendingCmd[2];
 
-// Single in-flight OTA job at a time (simple queueing model — extend to an
-// array if you need concurrent OTA pushes to multiple targets).
-static OtaPending otaPending;
-#define OTA_MAX_RETRIES  2
-#define OTA_RETRY_MS     90000UL
+static MeshTxn  meshTxn;
+static volatile bool meshBusy = false;   // gates fixed-address LoRa TX
+static uint32_t meshNextFree  = 0;
 
 // =============================================================================
 //  SECTION 10 — SHARED STATE
@@ -317,7 +296,6 @@ static OtaPending otaPending;
 static volatile bool     mqttOnline   = false;
 static volatile uint32_t lastLoRaRxMs = 0;
 
-// Last retransmission result shown on the OLED once nothing is waiting.
 #define RETRY_RESULT_SHOW_MS 10000UL
 static char     retryResult[22]  = "";
 static uint32_t retryResultUntil = 0;
@@ -342,6 +320,8 @@ struct Diag {
     uint32_t cmdAckAttempt2;
     uint32_t cmdAckAttempt3;
     uint32_t cmdNoAck;
+    uint32_t meshJobsDropped;
+    uint32_t meshRepeatsIgnored;
 };
 static Diag diag = {};
 
@@ -359,13 +339,14 @@ void  loraTask(void*);
 void  mqttTask(void*);
 void  appTask(void*);
 void  displayTask(void*);
+void  otaTask(void*);
 void  reinitLoRaRadio();
 bool  enqueueTxHi(uint8_t dest, uint8_t src, const uint8_t* data, uint16_t len);
 bool  enqueueTxLo(uint8_t dest, uint8_t src, const uint8_t* data, uint16_t len);
 bool  enqueueTxHiJson(uint8_t dest, uint8_t src, JsonDocument& doc);
 void  processRxPacket(LoRaRxPacket& pkt);
-void  handleLoRaAck(DynamicJsonDocument& loraDoc, uint8_t srcNode);       // motor only now
-void  handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode);       // valve mesh ack + ota_ack
+void  handleLoRaAck(DynamicJsonDocument& loraDoc, uint8_t srcNode);
+void  handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode);
 void  handleLoRaPower(DynamicJsonDocument& doc);
 void  mqttCallback(const char* topic, const uint8_t* payload, uint32_t len);
 bool  mqttConnectOnce();
@@ -379,32 +360,18 @@ void  armRetry(int idx, uint8_t dest, const char* device,
 void  publishAck(int idx);
 void  publishNoAck(int idx);
 void  clearPending(int idx);
-void  publishValveAck(int idx);
-void  publishValveNoAck(int idx);
-void  valveRetryTick();
+void  meshTick();
 void  setError(uint16_t code);
 void  clearError();
 void  setRetryResult(const char* text);
 void  printDiagnostics();
-int   parseVId(DynamicJsonDocument& doc);   // accepts VId as JSON number or string
-
-// OTA
+int   parseVId(DynamicJsonDocument& doc);
 void  handleOtaCommand(DynamicJsonDocument& doc);
-void  handleOtaCommandValveBranch(DynamicJsonDocument& doc);
-void  handleOtaCommandMotorBranch(DynamicJsonDocument& doc);
-void  otaTask(void* param);
 void  publishOtaAck(bool success, const char* deviceId, const char* nodeType, const char* detail);
-void  handleLoRaOtaAck(DynamicJsonDocument& loraDoc);   // non-mesh (motor/appliances/etc) only now
-
-// OLED helpers
-void  oledDrawSignalBars(int x, int y, int bars, int maxBars);
-int   rssiToLoRaBars(int rssi);
-int   csmToGsmBars(int csq);
-void  buildRetryLine(char* line, size_t size);
 void  oledRender();
 
 // =============================================================================
-//  SECTION 14 — ERROR HELPERS
+//  SECTION 14 — HELPERS
 // =============================================================================
 
 void setError(uint16_t code) {
@@ -421,18 +388,12 @@ void setRetryResult(const char* text) {
     retryResultUntil = millis() + RETRY_RESULT_SHOW_MS;
 }
 
-// Nodes reject msgId 0. Kept to 31 bits so firmware that still reads ids with
-// `doc["msgId"] | 0` (values above INT_MAX become 0) is not affected.
 uint32_t newMsgId() {
     uint32_t v;
     do { v = esp_random() & 0x7FFFFFFFUL; } while (v == 0);
     return v;
 }
 
-// AWS/API Gateway may serialize VId as a JSON number (7) or a JSON string
-// ("7") depending on how the payload was built. Parse both forms explicitly
-// instead of relying on ArduinoJson's `| 0` numeric coercion, which doesn't
-// reliably convert a quoted numeric string in all cases.
 int parseVId(DynamicJsonDocument& doc) {
     if (!doc.containsKey("VId")) return -1;
     JsonVariantConst v = doc["VId"];
@@ -445,8 +406,36 @@ int parseVId(DynamicJsonDocument& doc) {
     return -1;
 }
 
+bool queueMqtt(const char* topic, const char* payload, const char* what) {
+    MqttPubReq req;
+    strlcpy(req.topic, topic, sizeof(req.topic));
+    if (strlen(payload) >= sizeof(req.payload)) {
+        Serial.printf("⚠️ %s too long for MQTT buffer — dropped\n", what);
+        return false;
+    }
+    strlcpy(req.payload, payload, sizeof(req.payload));
+    Serial.printf("📤 %s → AWS: %s\n", what, req.payload);
+    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
+        diag.mqttPubFail++;
+        Serial.printf("⚠️ mqttPubQueue full — %s dropped\n", what);
+        return false;
+    }
+    return true;
+}
+
+bool queueMqttDoc(const char* topic, JsonDocument& doc, const char* what) {
+    char buf[sizeof(MqttPubReq::payload)];
+    if (measureJson(doc) >= sizeof(buf)) {
+        Serial.printf("⚠️ %s too long for MQTT buffer — dropped\n", what);
+        return false;
+    }
+    serializeJson(doc, buf, sizeof(buf));
+    return queueMqtt(topic, buf, what);
+}
+
 // =============================================================================
 //  SECTION 15 — SINGLE LoRa TASK  (Core 0, pri 3)
+//  Mesh packets go out at once; fixed-address packets wait for an idle mesh.
 // =============================================================================
 
 static void loraDoTx(LoRaTxPacket& pkt) {
@@ -454,12 +443,11 @@ static void loraDoTx(LoRaTxPacket& pkt) {
     LoRa.write(pkt.dest);
     LoRa.write(pkt.src);
     LoRa.write(pkt.buf, pkt.len);
-    LoRa.endPacket();       // BLOCKING — TX complete before returning
+    LoRa.endPacket();
     diag.txSent++;
     Serial.printf("📡 LoRa TX → dest:0x%02X  src:0x%02X  len:%u\n",
                   pkt.dest, pkt.src, pkt.len);
-    LoRa.receive();         // immediately re-enter RX
-    Serial.println("📻 Radio back in RX mode");
+    LoRa.receive();
 }
 
 void loraTask(void* param) {
@@ -470,25 +458,13 @@ void loraTask(void* param) {
     uint32_t lastWatchdog = millis();
 
     for (;;) {
-        // 1. TX hi-priority
-        {
-            LoRaTxPacket pkt;
-            if (xQueueReceive(txHiQueue, &pkt, 0) == pdTRUE) {
-                loraDoTx(pkt);
-                continue;
-            }
+        LoRaTxPacket pkt;
+        if (xQueueReceive(meshTxQueue, &pkt, 0) == pdTRUE) { loraDoTx(pkt); continue; }
+        if (!meshBusy) {
+            if (xQueueReceive(txHiQueue, &pkt, 0) == pdTRUE) { loraDoTx(pkt); continue; }
+            if (xQueueReceive(txLoQueue, &pkt, 0) == pdTRUE) { loraDoTx(pkt); continue; }
         }
 
-        // 2. TX lo-priority
-        {
-            LoRaTxPacket pkt;
-            if (xQueueReceive(txLoQueue, &pkt, 0) == pdTRUE) {
-                loraDoTx(pkt);
-                continue;
-            }
-        }
-
-        // 3. RX
         int packetSize = LoRa.parsePacket();
         if (packetSize >= 2) {
             LoRaRxPacket rx;
@@ -508,20 +484,14 @@ void loraTask(void* param) {
             dState.loraActive = true;
             diag.rxTotal++;
 
-            // Gateway must accept both packets addressed directly to it AND
-            // BROADCAST_ID traffic (valve-mesh commands/OTA/ack/ota_ack all
-            // transmit to BROADCAST_ID since intermediate relays need to
-            // hear them too).
             if (rx.dest != NODE3_ID && rx.dest != BROADCAST_ID) {
                 diag.rxDroppedDest++;
-            } else {
-                if (xQueueSend(rxQueue, &rx, 0) != pdTRUE)
-                    Serial.printf("⚠️ rxQueue full — dropped src:0x%02X\n", rx.src);
+            } else if (xQueueSend(rxQueue, &rx, 0) != pdTRUE) {
+                Serial.printf("⚠️ rxQueue full — dropped src:0x%02X\n", rx.src);
             }
             LoRa.receive();
         }
 
-        // 4. LoRa watchdog
         if ((millis() - lastWatchdog) >= LORA_WATCHDOG_MS) {
             Serial.println("⚠️ LoRa watchdog — reinitialising radio");
             dState.loraActive = false;
@@ -530,7 +500,7 @@ void loraTask(void* param) {
             lastWatchdog = millis();
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -569,14 +539,175 @@ bool enqueueTxHiJson(uint8_t dest, uint8_t src, JsonDocument& doc) {
 }
 
 // =============================================================================
-//  SECTION 17 — COMMAND HELPERS
+//  SECTION 17 — MESH JOB ENGINE  (runs on appTask, one job at a time)
 // =============================================================================
 
-// Valve commands now target a VId (1..15) over the mesh instead of a fixed
-// physical LoRa address. Every enqueue gets a fresh msgId + hop count;
-// retries reuse the SAME msgId so a node that already executed the command
-// (reached via a different relay path) answers with an ack-only duplicate
-// response instead of re-actuating the solenoid.
+uint32_t meshTimeoutMs() {
+    uint32_t t = 2UL * MESH_HOP_COUNT * FLOOD_LEVEL_MS + NODE_WORK_MS
+               + ACK_PRE_DELAY_MS + MESH_MARGIN_MS;
+    return t < MESH_MIN_TIMEOUT_MS ? MESH_MIN_TIMEOUT_MS : t;
+}
+
+// ---- Repeat filter -----------------------------------------------------------
+// The app resends a command every 2 min until it gets an answer. A repeat of a
+// job that is still queued or in flight is ignored; the original job sends the
+// one relay_ack / no_ack (or ota_ack / ota_no_ack) the app is waiting for.
+// A different command for the same valve (open after close) is still queued.
+
+static JobKey            jobKeys[MESH_JOB_QUEUE_DEPTH + 1];   // queued + in flight
+static SemaphoreHandle_t jobKeyMutex = nullptr;
+
+static bool jobKeyMatches(const JobKey& k, const MeshJob& j) {
+    if (!k.used || k.kind != j.kind || k.vId != j.vId || k.motorMesh != j.motorMesh) return false;
+    if (j.kind == MK_OTA) return true;                       // one OTA per target at a time
+    return strcmp(k.valve, j.valve) == 0 && strcmp(k.cmd, j.cmd) == 0;
+}
+
+// 1 = new job registered, 0 = repeat of a pending job, -1 = no room.
+static int claimJobKey(const MeshJob& j) {
+    int result = -1;
+    xSemaphoreTake(jobKeyMutex, portMAX_DELAY);
+    int freeIdx = -1;
+    for (int i = 0; i <= MESH_JOB_QUEUE_DEPTH; i++) {
+        if (jobKeyMatches(jobKeys[i], j)) { result = 0; break; }
+        if (!jobKeys[i].used && freeIdx < 0) freeIdx = i;
+    }
+    if (result != 0 && freeIdx >= 0) {
+        JobKey& k = jobKeys[freeIdx];
+        k.used      = true;
+        k.kind      = j.kind;
+        k.vId       = j.vId;
+        k.motorMesh = j.motorMesh;
+        strlcpy(k.valve, j.valve, sizeof(k.valve));
+        strlcpy(k.cmd,   j.cmd,   sizeof(k.cmd));
+        result = 1;
+    }
+    xSemaphoreGive(jobKeyMutex);
+    return result;
+}
+
+static void releaseJobKey(const MeshJob& j) {
+    xSemaphoreTake(jobKeyMutex, portMAX_DELAY);
+    for (int i = 0; i <= MESH_JOB_QUEUE_DEPTH; i++) {
+        if (jobKeyMatches(jobKeys[i], j)) { jobKeys[i].used = false; break; }
+    }
+    xSemaphoreGive(jobKeyMutex);
+}
+
+// Returns false only if the job could not be queued (queue full).
+bool queueMeshJob(const MeshJob& j) {
+    int claim = claimJobKey(j);
+    if (claim == 0) {
+        diag.meshRepeatsIgnored++;
+        Serial.printf("⏭ Repeat of a pending %s for %s%u %s %s — ignored, the original will answer\n",
+                      j.kind == MK_OTA ? "OTA" : "command", j.motorMesh ? "MOTOR " : "VId:",
+                      j.vId, j.valve, j.cmd);
+        return true;
+    }
+    if (claim < 0 || xQueueSend(meshJobQueue, &j, 0) != pdTRUE) {
+        if (claim > 0) releaseJobKey(j);
+        diag.meshJobsDropped++;
+        Serial.println("❌ Mesh job queue full — dropped");
+        return false;
+    }
+    Serial.printf("📥 Queued %s for %s%u msgId:%lu (%u waiting)\n",
+                  j.kind == MK_OTA ? "OTA" : "command", j.motorMesh ? "MOTOR " : "VId:",
+                  j.vId, (unsigned long)j.msgId,
+                  (unsigned)uxQueueMessagesWaiting(meshJobQueue));
+    return true;
+}
+
+void meshFinish() {
+    releaseJobKey(meshTxn.job);       // a later resend is a new command again
+    meshTxn.active = false;
+    meshBusy       = false;
+    meshNextFree   = millis() + MESH_GUARD_MS;
+}
+
+void meshTransmit() {
+    MeshJob& j = meshTxn.job;
+    LoRaTxPacket pkt;
+    pkt.dest = BROADCAST_ID;
+    pkt.src  = NODE3_ID;
+    pkt.len  = j.payloadLen;
+    memcpy(pkt.buf, j.payload, j.payloadLen);
+    if (xQueueSend(meshTxQueue, &pkt, pdMS_TO_TICKS(50)) != pdTRUE)
+        Serial.println("⚠️ meshTxQueue full — attempt not sent");
+
+    uint32_t to = meshTimeoutMs();
+    meshTxn.deadline = millis() + to;
+    Serial.printf("📡 [Attempt %u/%d] %s → %s%u msgId:%lu — timeout %lu s\n",
+                  meshTxn.attempt, MESH_ATTEMPTS, j.kind == MK_OTA ? "OTA" : "VALVE CMD",
+                  j.motorMesh ? "MOTOR " : "VId:", j.vId, (unsigned long)j.msgId,
+                  (unsigned long)(to / 1000));
+}
+
+// Same no_ack / ota_no_ack messages as v6.0.
+void meshFail() {
+    MeshJob& j = meshTxn.job;
+    char res[22];
+    if (j.kind == MK_CMD) {
+        StaticJsonDocument<256> doc;
+        doc["type"]     = "no_ack";
+        doc["UId"]      = DEVICE_ID;
+        doc["VId"]      = j.vId;
+        doc["device"]   = j.deviceId;
+        doc["actuator"] = "valve";
+        doc["attempts"] = CMD_MAX_RETRIES + 1;
+        Serial.printf("❌ NO ACK — VId:%u (%s) after %d attempts\n", j.vId, j.deviceId, MESH_ATTEMPTS);
+        queueMqttDoc(publish_topic, doc, "no_ack");
+        diag.cmdNoAck++;
+        setError(ERR_NO_ACK);
+        snprintf(res, sizeof(res), "V%u NO ACK", j.vId);
+    } else {
+        Serial.printf("❌ OTA — all 3 attempts exhausted for %s\n", j.deviceId);
+        publishOtaAck(false, j.deviceId, j.nodeType, "no ack after 3 attempts");
+        if (j.motorMesh) snprintf(res, sizeof(res), "MOTOR OTA NO ACK");
+        else             snprintf(res, sizeof(res), "OTA%u NO ACK", j.vId);
+    }
+    setRetryResult(res);
+    meshFinish();
+}
+
+void meshTick() {
+    uint32_t now = millis();
+
+    if (!meshTxn.active) {
+        if ((int32_t)(now - meshNextFree) < 0) return;
+        MeshJob job;
+        if (xQueueReceive(meshJobQueue, &job, 0) != pdTRUE) return;
+        meshTxn.active  = true;
+        meshTxn.job     = job;
+        meshTxn.attempt = 1;
+        meshBusy        = true;
+
+        char cmdStr[32];
+        if (job.kind == MK_CMD)  snprintf(cmdStr, sizeof(cmdStr), "V%u %s %s", job.vId, job.valve, job.cmd);
+        else if (job.motorMesh)  snprintf(cmdStr, sizeof(cmdStr), "Motor OTA");
+        else                     snprintf(cmdStr, sizeof(cmdStr), "V%u OTA", job.vId);
+        strlcpy((char*)dState.lastCmd, cmdStr, sizeof(dState.lastCmd));
+        clearError();
+
+        meshTransmit();
+        return;
+    }
+
+    if ((int32_t)(now - meshTxn.deadline) < 0) return;
+
+    if (meshTxn.attempt >= MESH_ATTEMPTS) {
+        meshFail();
+        return;
+    }
+    meshTxn.attempt++;
+    diag.cmdRetries++;
+    Serial.printf("🔁 Retry with the same msgId\n");
+    meshTransmit();
+}
+
+// =============================================================================
+//  SECTION 18 — COMMAND HELPERS  (packets identical to v6.0)
+// =============================================================================
+
 void enqueueValveCommand(uint8_t vId, const String& device, const String& valve,
                          const String& cmd, const String& fid, const String& bid) {
     if (vId < 1 || vId > MAX_VALVES) {
@@ -584,13 +715,16 @@ void enqueueValveCommand(uint8_t vId, const String& device, const String& valve,
         return;
     }
 
-    uint32_t msgId = newMsgId();
+    MeshJob j = {};
+    j.kind  = MK_CMD;
+    j.vId   = vId;
+    j.msgId = newMsgId();
 
     StaticJsonDocument<256> doc;
     doc["type"]    = "command_broadcast";
     doc["UId"]     = DEVICE_ID;
     doc["VId"]     = vId;
-    doc["msgId"]   = msgId;
+    doc["msgId"]   = j.msgId;
     doc["hop"]     = MESH_HOP_COUNT;
     doc["device"]  = device;
     doc["valve"]   = valve;
@@ -598,43 +732,21 @@ void enqueueValveCommand(uint8_t vId, const String& device, const String& valve,
     if (fid.length()) doc["FId"] = fid;
     if (bid.length()) doc["BId"] = bid;
 
-    char buf[256];
-    uint16_t n = (uint16_t)serializeJson(doc, buf, sizeof(buf));
-
-    if (enqueueTxLo(BROADCAST_ID, NODE3_ID, (const uint8_t*)buf, n)) {
-        Serial.printf("📡 [Attempt 1/3] VALVE CMD → VId:%d msgId:%lu dev:%s valve:%s cmd:%s\n",
-                      vId, (unsigned long)msgId, device.c_str(), valve.c_str(), cmd.c_str());
-
-        char cmdStr[32];
-        snprintf(cmdStr, sizeof(cmdStr), "V%d %s %s", vId, valve.c_str(), cmd.c_str());
-        strlcpy((char*)dState.lastCmd, cmdStr, sizeof(dState.lastCmd));
-        clearError();
-
-        int idx = vId - 1;
-        PendingValve& p = pendingValve[idx];
-        p.active      = true;
-        p.vId         = vId;
-        p.retryCount  = 0;
-        p.msgId       = msgId;
-        p.nextRetryMs = millis() + CMD_RETRY_MS;
-        p.payloadLen  = n;
-        memset(p.ackJson, 0, sizeof(p.ackJson));
-        memcpy(p.payload, buf, n);
-        strlcpy(p.deviceId, device.c_str(), sizeof(p.deviceId));
-        // Same normalising the node applies, so these match what it executed.
-        String valveNorm = valve; valveNorm.toUpperCase();
-        String cmdNorm   = cmd;   cmdNorm.toLowerCase();
-        strlcpy(p.valve, valveNorm.c_str(), sizeof(p.valve));
-        strlcpy(p.cmd,   cmdNorm.c_str(),   sizeof(p.cmd));
-
-        Serial.printf("⏱ Waiting for ACK — VId:%d msgId:%lu — timeout in %lu s\n",
-                      vId, (unsigned long)msgId, CMD_RETRY_MS / 1000);
-    } else {
-        Serial.println("❌ Valve CMD: LoRa TX queue full — could not enqueue");
+    if (measureJson(doc) > LORA_MAX_BODY - RELAY_HEADROOM) {
+        Serial.println("❌ Valve CMD too long for LoRa — dropped");
+        return;
     }
+    j.payloadLen = (uint16_t)serializeJson(doc, j.payload, sizeof(j.payload));
+
+    strlcpy(j.deviceId, device.c_str(), sizeof(j.deviceId));
+    String valveNorm = valve; valveNorm.toUpperCase();
+    String cmdNorm   = cmd;   cmdNorm.toLowerCase();
+    strlcpy(j.valve, valveNorm.c_str(), sizeof(j.valve));
+    strlcpy(j.cmd,   cmdNorm.c_str(),   sizeof(j.cmd));
+
+    queueMeshJob(j);
 }
 
-// Motor command — unchanged from v4.5 (fixed address, single slot).
 void enqueueMotorCommand(const String& device, const String& state,
                          const String& fid, const String& bid) {
     StaticJsonDocument<256> doc;
@@ -669,7 +781,7 @@ void enqueueMqttStatus(bool connected) {
 }
 
 // =============================================================================
-//  SECTION 18 — MQTT CALLBACK
+//  SECTION 19 — MQTT CALLBACK  (runs inside modem.mqtt_handle() on mqttTask)
 // =============================================================================
 
 void mqttCallback(const char* topic, const uint8_t* payload, uint32_t len) {
@@ -705,8 +817,6 @@ void mqttCallback(const char* topic, const uint8_t* payload, uint32_t len) {
     const char* device = doc["device"] | "";
 
     if (doc.containsKey("valve")) {
-        // Valve commands must now carry VId (1..15) — that's how the
-        // gateway knows which physical node to route through the mesh.
         int vId = parseVId(doc);
         if (vId < 1 || vId > MAX_VALVES) {
             Serial.println("⚠️ command_broadcast: missing/invalid VId for valve command");
@@ -732,160 +842,18 @@ void mqttCallback(const char* topic, const uint8_t* payload, uint32_t len) {
 }
 
 // =============================================================================
-//  SECTION 18b — OTA HANDLING
+//  SECTION 19b — OTA HANDLING  (same packets and messages as v6.0)
 //
-//  Expected "OTA/mode" MQTT payload from AWS:
+//  "OTA/mode" payload from AWS:
 //  {
-//    "UId":    "42",
-//    "FId":    "farm1",
-//    "BId":    "block3",
-//    "device": "valve node",     // "valve node" | "motor node" | "VMCgateway"
-//    "VId":    7,                // REQUIRED when device == "valve node" (1..15)
-//    "wifi_ssid": "farm-ap",
+//    "UId": "66", "FId": "...", "BId": "...",
+//    "device": "valve node" | "motor node" | "VMC gateway",
+//    "VId": 7,                       // valve node only (1..15)
+//    "wifi_ssid": "farm-ap",         // forwarded to the node
 //    "wifi_pass": "secret",
-//    "url":    "https://github.com/org/repo/releases/download/v1.2.0/node.bin"
+//    "url": "https://.../node.bin"
 //  }
-//
-//  Valve and motor OTA both route over the mesh (BROADCAST_ID + VId + msgId
-//  + hop) — motor uses reserved VId:0. VMCgateway is the only device type
-//  that self-flashes (joins wifi_ssid/wifi_pass, downloads url, reboots).
 // =============================================================================
-
-// Valve-node OTA — mesh-routed by VId, same envelope shape as commands.
-// Motor node has no VId of its own (there's only one) — reserve VId:0 as
-// the sentinel that means "the motor node" in the same mesh envelope shape
-// valve commands use. Valve nodes relay it (their VId never equals 0), and
-// the motor node consumes it by checking for VId:0 specifically.
-#define MOTOR_MESH_VID 0
-
-void handleOtaCommandValveBranch(DynamicJsonDocument& doc) {
-    const char* deviceType = doc["device"] | "";
-    int vId = parseVId(doc);
-
-    if (vId < 1 || vId > MAX_VALVES) {
-        Serial.println("⚠️ OTA: missing/invalid VId for valve node target");
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "missing VId");
-        return;
-    }
-    if (otaPending.active) {
-        Serial.println("⚠️ OTA already in progress — ignoring new request until it completes");
-        return;
-    }
-    const char* url = doc["url"] | "";
-    if (!strlen(url)) {
-        Serial.println("⚠️ OTA: missing 'url' field");
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "missing url");
-        return;
-    }
-
-    uint32_t msgId  = newMsgId();
-    const char* fid = doc["FId"] | "";
-    const char* bid = doc["BId"] | "";
-
-    StaticJsonDocument<256> pkt;
-    pkt["type"]  = "ota";
-    pkt["UId"]   = DEVICE_ID;
-    pkt["VId"]   = vId;
-    pkt["msgId"] = msgId;
-    pkt["hop"]   = MESH_HOP_COUNT;
-    pkt["url"]   = url;
-    if (doc.containsKey("wifi_ssid")) pkt["wifi"] = doc["wifi_ssid"];
-    if (doc.containsKey("wifi_pass")) pkt["pass"] = doc["wifi_pass"];
-    if (strlen(fid)) pkt["FId"] = fid;
-    if (strlen(bid)) pkt["BId"] = bid;
-
-    char buf[256];
-    uint16_t n = (uint16_t)serializeJson(pkt, buf, sizeof(buf));
-    if (n >= sizeof(buf)) {
-        Serial.println("❌ OTA packet too large (256B) — shorten the URL");
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "payload too large");
-        return;
-    }
-
-    if (enqueueTxLo(BROADCAST_ID, NODE3_ID, (const uint8_t*)buf, n)) {
-        Serial.printf("📡 [OTA attempt 1/3] → VId:%d msgId:%lu url:%s\n",
-                      vId, (unsigned long)msgId, url);
-
-        otaPending.active      = true;
-        otaPending.destNode    = 0;
-        otaPending.vId         = (uint8_t)vId;
-        otaPending.motorMesh   = false;
-        otaPending.msgId       = msgId;
-        otaPending.retryCount  = 0;
-        otaPending.nextRetryMs = millis() + OTA_RETRY_MS;
-        otaPending.payloadLen  = n;
-        memset(otaPending.ackJson, 0, sizeof(otaPending.ackJson));
-        memcpy(otaPending.payload, buf, n);
-        strlcpy(otaPending.deviceId, doc["UId"] | DEVICE_ID, sizeof(otaPending.deviceId));
-        strlcpy(otaPending.nodeType, deviceType, sizeof(otaPending.nodeType));
-    } else {
-        Serial.println("❌ OTA: LoRa TX queue full — could not enqueue");
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "tx queue full");
-    }
-}
-
-// Motor OTA — same mesh envelope/relay/dedupe as valve OTA, using the
-// reserved VId:0 sentinel instead of a VId 1-15. This means motor OTA now
-// reaches the motor node even if it's not in direct radio range of the
-// gateway, by hopping through valve nodes exactly like a valve command does.
-void handleOtaCommandMotorBranch(DynamicJsonDocument& doc) {
-    const char* deviceType = doc["device"] | "";
-
-    if (otaPending.active) {
-        Serial.println("⚠️ OTA already in progress — ignoring new request until it completes");
-        return;
-    }
-    const char* url = doc["url"] | "";
-    if (!strlen(url)) {
-        Serial.println("⚠️ OTA: missing 'url' field");
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "missing url");
-        return;
-    }
-
-    uint32_t msgId  = newMsgId();
-    const char* fid = doc["FId"] | "";
-    const char* bid = doc["BId"] | "";
-
-    StaticJsonDocument<256> pkt;
-    pkt["type"]  = "ota";
-    pkt["UId"]   = DEVICE_ID;
-    pkt["VId"]   = MOTOR_MESH_VID;   // 0 — reserved sentinel for the motor node
-    pkt["msgId"] = msgId;
-    pkt["hop"]   = MESH_HOP_COUNT;
-    pkt["url"]   = url;
-    if (doc.containsKey("wifi_ssid")) pkt["wifi"] = doc["wifi_ssid"];
-    if (doc.containsKey("wifi_pass")) pkt["pass"] = doc["wifi_pass"];
-    if (strlen(fid)) pkt["FId"] = fid;
-    if (strlen(bid)) pkt["BId"] = bid;
-
-    char buf[256];
-    uint16_t n = (uint16_t)serializeJson(pkt, buf, sizeof(buf));
-    if (n >= sizeof(buf)) {
-        Serial.println("❌ OTA packet too large (256B) — shorten the URL");
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "payload too large");
-        return;
-    }
-
-    if (enqueueTxLo(BROADCAST_ID, NODE3_ID, (const uint8_t*)buf, n)) {
-        Serial.printf("📡 [OTA attempt 1/3] → MOTOR msgId:%lu url:%s\n", (unsigned long)msgId, url);
-
-        otaPending.active      = true;
-        otaPending.destNode    = 0;
-        otaPending.vId         = MOTOR_MESH_VID;
-        otaPending.motorMesh   = true;
-        otaPending.msgId       = msgId;
-        otaPending.retryCount  = 0;
-        otaPending.nextRetryMs = millis() + OTA_RETRY_MS;
-        otaPending.payloadLen  = n;
-        memset(otaPending.ackJson, 0, sizeof(otaPending.ackJson));
-        memcpy(otaPending.payload, buf, n);
-        strlcpy(otaPending.deviceId, doc["UId"] | DEVICE_ID, sizeof(otaPending.deviceId));
-        strlcpy(otaPending.nodeType, deviceType, sizeof(otaPending.nodeType));
-    } else {
-        Serial.println("❌ OTA: LoRa TX queue full — could not enqueue");
-        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "tx queue full");
-    }
-}
 
 void publishOtaAck(bool success, const char* deviceId, const char* nodeType, const char* detail) {
     StaticJsonDocument<256> doc;
@@ -894,21 +862,57 @@ void publishOtaAck(bool success, const char* deviceId, const char* nodeType, con
     doc["device"] = deviceId;
     doc["node"]   = nodeType;
     if (detail && strlen(detail)) doc["detail"] = detail;
-
-    MqttPubReq req;
-    strlcpy(req.topic, publish_ota_topic, sizeof(req.topic));
-    serializeJson(doc, req.payload, sizeof(req.payload));
-
-    Serial.printf("📤 %s → AWS: %s\n", success ? "ota_ack" : "ota_no_ack", req.payload);
-    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-        diag.mqttPubFail++;
-        Serial.println("⚠️ mqttPubQueue full — OTA ack dropped");
-    }
+    queueMqttDoc(publish_ota_topic, doc, success ? "ota_ack" : "ota_no_ack");
 }
 
-// Self-OTA for gateway-type devices (VMCgateway, appliances gateway,
-// fertigation gateway, sensor gateway) — joins wifi_ssid/wifi_pass
-// separately from the LTE modem link, downloads url, and flashes itself.
+// Builds the v6.0 "ota" packet (VId 1..15 for a valve, 0 for the motor).
+void enqueueMeshOta(DynamicJsonDocument& doc, int vId, bool motorMesh) {
+    const char* deviceType = doc["device"] | "";
+    const char* url = doc["url"] | "";
+    if (!strlen(url)) {
+        Serial.println("⚠️ OTA: missing 'url' field");
+        publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "missing url");
+        return;
+    }
+
+    MeshJob j = {};
+    j.kind      = MK_OTA;
+    j.vId       = (uint8_t)vId;
+    j.motorMesh = motorMesh;
+    j.msgId     = newMsgId();
+    strlcpy(j.deviceId, doc["UId"] | DEVICE_ID, sizeof(j.deviceId));
+    strlcpy(j.nodeType, deviceType, sizeof(j.nodeType));
+
+    const char* fid = doc["FId"] | "";
+    const char* bid = doc["BId"] | "";
+
+    StaticJsonDocument<384> pkt;
+    pkt["type"]  = "ota";
+    pkt["UId"]   = DEVICE_ID;
+    pkt["VId"]   = vId;
+    pkt["msgId"] = j.msgId;
+    pkt["hop"]   = MESH_HOP_COUNT;
+    pkt["url"]   = url;
+    if (doc.containsKey("wifi_ssid")) pkt["wifi"] = doc["wifi_ssid"];
+    if (doc.containsKey("wifi_pass")) pkt["pass"] = doc["wifi_pass"];
+    if (strlen(fid)) pkt["FId"] = fid;
+    if (strlen(bid)) pkt["BId"] = bid;
+
+    if (measureJson(pkt) > LORA_MAX_BODY - RELAY_HEADROOM) {
+        Serial.printf("❌ OTA packet %u B — too large to relay, shorten the URL\n",
+                      (unsigned)measureJson(pkt));
+        publishOtaAck(false, j.deviceId, deviceType, "payload too large");
+        return;
+    }
+    j.payloadLen = (uint16_t)serializeJson(pkt, j.payload, sizeof(j.payload));
+
+    if (!queueMeshJob(j))
+        publishOtaAck(false, j.deviceId, deviceType, "tx queue full");
+}
+
+// Gateway self-OTA: joins wifi_ssid / wifi_pass from the OTA payload (the LTE
+// link stays up for MQTT), downloads url and reboots. Runs on otaTask so the
+// download never stalls modem.mqtt_handle().
 void selfOtaUpdate(const char* deviceType, const char* uid,
                    const char* ssid, const char* pass, const char* url) {
     if (!ssid || !strlen(ssid) || !pass || !strlen(pass)) {
@@ -921,10 +925,8 @@ void selfOtaUpdate(const char* deviceType, const char* uid,
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid, pass);
 
-    uint32_t deadline = millis() + 20000UL;   // 20 s to join
-    while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
+    uint32_t deadline = millis() + 20000UL;
+    while (WiFi.status() != WL_CONNECTED && millis() < deadline) vTaskDelay(pdMS_TO_TICKS(500));
 
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("❌ Gateway OTA: WiFi join failed/timed out");
@@ -933,7 +935,7 @@ void selfOtaUpdate(const char* deviceType, const char* uid,
         return;
     }
 
-    Serial.printf("✅ WiFi joined, IP: %s — starting download from %s\n",
+    Serial.printf("✅ WiFi joined, IP: %s — downloading %s\n",
                   WiFi.localIP().toString().c_str(), url);
     Serial.printf("Free heap before OTA: %u bytes\n", ESP.getFreeHeap());
 
@@ -942,46 +944,25 @@ void selfOtaUpdate(const char* deviceType, const char* uid,
 
     for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         Serial.printf("Gateway OTA attempt %d/%d...\n", attempt, MAX_ATTEMPTS);
-
         WiFiClientSecure client;
         client.setInsecure();
         client.setTimeout(15000);
-
         httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         httpUpdate.rebootOnUpdate(true);
         result = httpUpdate.update(client, url);
-
         if (result == HTTP_UPDATE_OK) break;
-
         Serial.printf("  attempt %d failed: %d %s\n", attempt,
                       httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-        if (attempt < MAX_ATTEMPTS) {
-            vTaskDelay(pdMS_TO_TICKS(3000));
-        }
+        if (attempt < MAX_ATTEMPTS) vTaskDelay(pdMS_TO_TICKS(3000));
     }
 
-    switch (result) {
-        case HTTP_UPDATE_FAILED:
-            Serial.printf("❌ Gateway OTA failed after %d attempts: %d %s\n",
-                          MAX_ATTEMPTS, httpUpdate.getLastError(),
-                          httpUpdate.getLastErrorString().c_str());
-            publishOtaAck(false, uid, deviceType, httpUpdate.getLastErrorString().c_str());
-            break;
-        case HTTP_UPDATE_NO_UPDATES:
-            Serial.println("ℹ️ Gateway OTA: server reported no update needed");
-            publishOtaAck(false, uid, deviceType, "no update available at url");
-            break;
-        case HTTP_UPDATE_OK:
-            Serial.println("✅ Gateway OTA applied — rebooting");
-            break;
-    }
+    if (result == HTTP_UPDATE_FAILED)
+        publishOtaAck(false, uid, deviceType, httpUpdate.getLastErrorString().c_str());
+    else if (result == HTTP_UPDATE_NO_UPDATES)
+        publishOtaAck(false, uid, deviceType, "no update available at url");
 
     WiFi.mode(WIFI_OFF);
 }
-
-// =============================================================================
-//  SELF-OTA TASK  (Core 1, pri 1 — lowest, never competes with LoRa/MQTT)
-// =============================================================================
 
 void otaTask(void* param) {
     for (;;) {
@@ -1000,69 +981,51 @@ void handleOtaCommand(DynamicJsonDocument& doc) {
         return;
     }
 
-    // Valve node — mesh-routed by VId.
     if (strcasecmp(deviceType, "valve node") == 0) {
-        handleOtaCommandValveBranch(doc);
+        int vId = parseVId(doc);
+        if (vId < 1 || vId > MAX_VALVES) {
+            Serial.println("⚠️ OTA: missing/invalid VId for valve node target");
+            publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "missing VId");
+            return;
+        }
+        enqueueMeshOta(doc, vId, false);
         return;
     }
 
-    // Motor node — mesh-routed via reserved VId:0 sentinel (same broadcast
-    // mesh as valve, so it reaches the motor node even out of direct range).
     if (strcasecmp(deviceType, "motor node") == 0) {
-        handleOtaCommandMotorBranch(doc);
+        enqueueMeshOta(doc, MOTOR_MESH_VID, true);
         return;
     }
 
-    // This gateway is a VMC gateway — the only self-flash target it should
-    // ever accept is "VMCgateway". Anything else is an unrecognized/typo'd
-    // device string, NOT an implicit "flash me".
-    if (strcasecmp(deviceType, "VMC gateway") != 0) {
-        Serial.printf("⚠️ OTA: unrecognized device type '%s' — rejecting (not VMC gateway, valve node, or motor node)\n",
-                      deviceType);
+    if (strcasecmp(deviceType, "VMC gateway") != 0 &&
+        strcasecmp(deviceType, "VMCgateway")  != 0) {
+        Serial.printf("⚠️ OTA: unrecognized device type '%s' — rejecting\n", deviceType);
         publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "unrecognized device type");
         return;
     }
 
-    // Hand the job to otaTask instead of calling selfOtaUpdate() here:
-    // this function runs ON mqttTask (called from inside modem.mqtt_handle()),
-    // and a multi-second/minute blocking OTA download here would stall the
-    // 10ms mqtt_handle() pump loop and cause MQTT to drop.
-    const char* url  = doc["url"] | "";
-    const char* ssid = doc["wifi_ssid"] | "";
-    const char* pass = doc["wifi_pass"] | "";
+    const char* url = doc["url"] | "";
     if (!strlen(url)) {
-        Serial.println("⚠️ Gateway OTA: missing 'url' field");
         publishOtaAck(false, doc["UId"] | DEVICE_ID, deviceType, "missing url");
         return;
     }
 
     SelfOtaJob job;
     strlcpy(job.deviceType, deviceType, sizeof(job.deviceType));
-    strlcpy(job.uid, doc["UId"] | DEVICE_ID, sizeof(job.uid));
-    strlcpy(job.ssid, ssid, sizeof(job.ssid));
-    strlcpy(job.pass, pass, sizeof(job.pass));
-    strlcpy(job.url, url, sizeof(job.url));
+    strlcpy(job.uid,  doc["UId"] | DEVICE_ID,  sizeof(job.uid));
+    strlcpy(job.ssid, doc["wifi_ssid"] | "",   sizeof(job.ssid));
+    strlcpy(job.pass, doc["wifi_pass"] | "",   sizeof(job.pass));
+    strlcpy(job.url,  url,                     sizeof(job.url));
 
-    if (xQueueSend(otaJobQueue, &job, 0) != pdTRUE) {
-        Serial.println("⚠️ otaJobQueue full — OTA already in progress, dropping new request");
+    if (xQueueSend(otaJobQueue, &job, 0) != pdTRUE)
         publishOtaAck(false, job.uid, deviceType, "OTA already in progress");
-    } else {
+    else
         Serial.println("📨 Self-OTA job queued — handing off to otaTask");
-    }
-}
-
-// Non-mesh OTA ack — retired now that motor also uses the mesh envelope.
-// Kept as a stub in case a future fixed-address node type is reintroduced;
-// currently unreachable since otaPending is always either valve or motor mesh.
-void handleLoRaOtaAck(DynamicJsonDocument& loraDoc) {
-    Serial.println("⏭ handleLoRaOtaAck: no fixed-address OTA targets configured — ignoring");
 }
 
 // =============================================================================
-//  SECTION 19 — MQTT CONNECT
-//  Mirrors the stable sensor-gateway reference: cert set every attempt
-//  inside mqttConnectOnce (not guarded), no disconnect-before-connect call,
-//  no separate fast-restart-after-N-failures path. Simpler and known-stable.
+//  SECTION 20 — MQTT CONNECT  (A7670, as v5.3)
+//  Certificate set on every attempt, no disconnect-before-connect.
 // =============================================================================
 
 bool mqttConnectOnce() {
@@ -1075,7 +1038,7 @@ bool mqttConnectOnce() {
 }
 
 // =============================================================================
-//  SECTION 20 — MQTT TASK  (Core 1, pri 3)
+//  SECTION 21 — MQTT TASK  (Core 1, pri 3)
 // =============================================================================
 
 void mqttTask(void* param) {
@@ -1091,13 +1054,14 @@ void mqttTask(void* param) {
     vTaskDelay(pdMS_TO_TICKS(500));
     Serial.println("📶 Modem: " + modem.getModemInfo());
 
-    modem.sendAT("+CNMP=38");
+    modem.sendAT("+CNMP=38");          // LTE only
     modem.waitResponse();
 
     Serial.println("📶 Waiting for network...");
     uint32_t netDeadline = millis() + 90000UL;
     while (!modem.waitForNetwork(5000)) {
         Serial.println("⏳ Registering...");
+        dState.gsmRSSI = modem.getSignalQuality();
         if (millis() > netDeadline) {
             Serial.println("🔄 Network timeout — restarting modem");
             modem.restart();
@@ -1113,7 +1077,7 @@ void mqttTask(void* param) {
     }
     Serial.println("✅ GPRS connected | IP: " + modem.localIP().toString());
 
-    modem.NTPServerSync("pool.ntp.org", 20);
+    modem.NTPServerSync("pool.ntp.org", 20);   // TLS needs a correct clock
     vTaskDelay(pdMS_TO_TICKS(2000));
     Serial.println("✅ NTP done");
 
@@ -1130,51 +1094,41 @@ void mqttTask(void* param) {
     uint32_t lastSuccessMs = millis();
     uint32_t lastCsqMs     = 0;
     bool     notified      = false;
-    uint8_t  failCount     = 0;   // consecutive PUBLISH failures — matches reference's MAX_MQTT_FAILURES pattern
+    uint8_t  failCount     = 0;   // consecutive publish failures
 
     for (;;) {
         uint32_t now = millis();
 
+        // Pump the modem every 10 ms — incoming commands arrive here.
         if (now - lastHandleMs >= 10) {
             lastHandleMs = now;
             modem.mqtt_handle();
         }
 
-        // Update GSM signal strength every 10 s
         if (now - lastCsqMs >= 10000UL) {
-            lastCsqMs    = now;
+            lastCsqMs      = now;
             dState.gsmRSSI = modem.getSignalQuality();   // CSQ 0–31
         }
 
-        // Drain publish queue when connected
+        // Drain one publish per pass (QoS 0, as v5.3).
         if (state == CONNECTED) {
             MqttPubReq req;
             if (xQueueReceive(mqttPubQueue, &req, 0) == pdTRUE) {
-                // QoS 0 for everything, matching the reference gateway.
-                // QoS 1 requires a PUBACK round-trip per message; the A7670
-                // logged that as an "Unhandled" URC (+CMQTTPUB: 0,0) right
-                // before a disconnect, so QoS 0 removes that ack bookkeeping
-                // entirely instead of trying to get PUBACK handling right.
-                int qos = 0;
-                if (modem.mqtt_publish(0, req.topic, req.payload, qos)) {
+                if (modem.mqtt_publish(0, req.topic, req.payload, 0)) {
                     diag.mqttPubOk++;
                     failCount = 0;
                     Serial.printf("✅ Published → [%s]: %s\n", req.topic, req.payload);
                 } else {
                     diag.mqttPubFail++;
                     Serial.println("❌ Publish failed — re-queuing");
-                    xQueueSend(mqttPubQueue, &req, 0);
-                    // Repeated publish failures while mqtt_connected() still
-                    // reports true usually means the session is actually
-                    // dead server-side — force a reconnect rather than
-                    // spinning on publish forever, same as the reference.
+                    xQueueSendToFront(mqttPubQueue, &req, 0);   // keep the order
                     if (++failCount >= MAX_MQTT_FAILURES) {
-                        failCount          = 0;
-                        notified           = false;
-                        state              = CONNECTING;
-                        mqttOnline         = false;
-                        dState.mqttOnline  = false;
-                        nextRetry          = now + retryDelay;
+                        failCount         = 0;
+                        notified          = false;
+                        state             = CONNECTING;
+                        mqttOnline        = false;
+                        dState.mqttOnline = false;
+                        nextRetry         = now + retryDelay;
                     }
                 }
             }
@@ -1184,7 +1138,7 @@ void mqttTask(void* param) {
         case CONNECTING:
             if (now < nextRetry) break;
 
-            if (lastSuccessMs > 0 && (now - lastSuccessMs) > LTE_WATCHDOG_MS) {
+            if ((now - lastSuccessMs) > LTE_WATCHDOG_MS) {
                 diag.lteWatchdogFires++;
                 Serial.println("🔄 LTE watchdog — restarting modem");
                 modem.restart();
@@ -1201,13 +1155,13 @@ void mqttTask(void* param) {
 
             Serial.println("🔌 MQTT connecting...");
             if (mqttConnectOnce()) {
-                state            = CONNECTED;
-                retryDelay       = MQTT_RETRY_MIN_MS;
-                lastSuccessMs    = millis();
-                notified         = false;
-                failCount        = 0;
-                mqttOnline       = true;
-                dState.mqttOnline= true;
+                state             = CONNECTED;
+                retryDelay        = MQTT_RETRY_MIN_MS;
+                lastSuccessMs     = millis();
+                notified          = false;
+                failCount         = 0;
+                mqttOnline        = true;
+                dState.mqttOnline = true;
                 diag.mqttReconnects++;
                 Serial.println("✅ MQTT connected");
             } else {
@@ -1231,8 +1185,6 @@ void mqttTask(void* param) {
                 break;
             }
             if (!notified) {
-                mqttOnline        = true;
-                dState.mqttOnline = true;
                 enqueueMqttStatus(true);
                 notified = true;
             }
@@ -1245,9 +1197,7 @@ void mqttTask(void* param) {
 }
 
 // =============================================================================
-
-// =============================================================================
-//  SECTION 21 — RETRY HELPERS  (motor — unchanged from v4.5)
+//  SECTION 22 — MOTOR RETRY HELPERS  (unchanged)
 // =============================================================================
 
 void armRetry(int idx, uint8_t dest, const char* device,
@@ -1268,18 +1218,7 @@ void armRetry(int idx, uint8_t dest, const char* device,
 }
 
 void publishAck(int idx) {
-    PendingCmd& p = pendingCmd[idx];
-
-    MqttPubReq req;
-    strlcpy(req.topic,   publish_topic, sizeof(req.topic));
-    strlcpy(req.payload, p.ackJson,     sizeof(req.payload));
-
-    Serial.printf("📤 relay_ack → AWS: %s\n", req.payload);
-
-    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-        diag.mqttPubFail++;
-        Serial.println("⚠️ mqttPubQueue full — relay_ack dropped");
-    }
+    queueMqtt(publish_topic, pendingCmd[idx].ackJson, "relay_ack");
     clearPending(idx);
 }
 
@@ -1293,21 +1232,13 @@ void publishNoAck(int idx) {
     doc["actuator"] = p.actuator;
     doc["attempts"] = CMD_MAX_RETRIES + 1;
 
-    MqttPubReq req;
-    strlcpy(req.topic, publish_topic, sizeof(req.topic));
-    serializeJson(doc, req.payload, sizeof(req.payload));
-
-    Serial.printf("❌ NO ACK — %s (%s) after %d attempts → AWS: %s\n",
-                  p.deviceId, p.actuator, CMD_MAX_RETRIES + 1, req.payload);
+    Serial.printf("❌ NO ACK — %s (%s) after %d attempts\n",
+                  p.deviceId, p.actuator, CMD_MAX_RETRIES + 1);
+    queueMqttDoc(publish_topic, doc, "no_ack");
 
     setError(ERR_NO_ACK);
     setRetryResult("MOTOR NO ACK");
     diag.cmdNoAck++;
-
-    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-        diag.mqttPubFail++;
-        Serial.println("⚠️ mqttPubQueue full — no_ack dropped");
-    }
     clearPending(idx);
 }
 
@@ -1316,55 +1247,10 @@ void clearPending(int idx) {
 }
 
 // =============================================================================
-//  SECTION 21b — RETRY HELPERS  (NEW — valve mesh, 15 slots)
+//  SECTION 23 — ACK HANDLERS
 // =============================================================================
 
-void publishValveAck(int idx) {
-    PendingValve& p = pendingValve[idx];
-    MqttPubReq req;
-    strlcpy(req.topic,   publish_topic, sizeof(req.topic));
-    strlcpy(req.payload, p.ackJson,     sizeof(req.payload));
-    Serial.printf("📤 relay_ack → AWS: %s\n", req.payload);
-    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-        diag.mqttPubFail++;
-        Serial.println("⚠️ mqttPubQueue full — relay_ack dropped");
-    }
-    p.active = false;
-}
-
-void publishValveNoAck(int idx) {
-    PendingValve& p = pendingValve[idx];
-    StaticJsonDocument<256> doc;
-    doc["type"]     = "no_ack";
-    doc["UId"]      = DEVICE_ID;
-    doc["VId"]      = p.vId;
-    doc["device"]   = p.deviceId;
-    doc["actuator"] = "valve";
-    doc["attempts"] = CMD_MAX_RETRIES + 1;
-
-    MqttPubReq req;
-    strlcpy(req.topic, publish_topic, sizeof(req.topic));
-    serializeJson(doc, req.payload, sizeof(req.payload));
-    Serial.printf("❌ NO ACK — VId:%d (%s) after %d attempts → AWS: %s\n",
-                  p.vId, p.deviceId, CMD_MAX_RETRIES + 1, req.payload);
-
-    setError(ERR_NO_ACK);
-    char result[22];
-    snprintf(result, sizeof(result), "V%d NO ACK", p.vId);
-    setRetryResult(result);
-    diag.cmdNoAck++;
-    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
-        diag.mqttPubFail++;
-        Serial.println("⚠️ mqttPubQueue full — no_ack dropped");
-    }
-    p.active = false;
-}
-
-// =============================================================================
-//  SECTION 22 — ACK HANDLERS
-// =============================================================================
-
-// Motor-only now (valve traffic goes through handleMeshAck below).
+// Motor (fixed address) — unchanged.
 void handleLoRaAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
     PendingCmd& p = pendingCmd[PENDING_MOTOR_IDX];
 
@@ -1406,11 +1292,10 @@ void handleLoRaAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
     publishAck(PENDING_MOTOR_IDX);
 }
 
-// NEW — valve-mesh "ack" and "ota_ack", matched by VId + replyTo(msgId)
-// instead of a fixed slot / node-label sniff.
+// Valve-mesh "ack" and "ota_ack" (VId + replyTo), matched to the job in flight.
 void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
     const char* type = loraDoc["type"] | "";
-    int vId          = loraDoc["VId"]     | -1;
+    int vId          = loraDoc["VId"]  | -1;
     uint32_t replyTo = loraDoc["replyTo"].as<uint32_t>();
 
     if (vId < 0 || vId > MAX_VALVES) {
@@ -1418,31 +1303,30 @@ void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
         return;
     }
 
+    MeshTxn& x = meshTxn;
+    MeshJob& j = x.job;
+
     if (strcmp(type, "ack") == 0) {
-        // Valve command acks only — motor's non-OTA ack goes through
-        // handleLoRaAck() since regular motor commands are still fixed-address.
         if (vId < 1) {
             Serial.println("⏭ ack: VId:0 is reserved for motor OTA only — dropping");
             return;
         }
-        int idx = vId - 1;
-        PendingValve& p = pendingValve[idx];
-        if (!p.active || p.msgId != replyTo) {
-            Serial.printf("⏭ Stale/duplicate ACK VId:%d (no matching pending msgId)\n", vId);
+        if (!x.active || j.kind != MK_CMD || j.vId != vId || j.msgId != replyTo) {
+            Serial.printf("⏭ Stale/duplicate ACK VId:%d (no matching command in flight)\n", vId);
             return;
         }
 
-        int attemptNum = p.retryCount + 1;
-        if      (attemptNum == 1) diag.cmdAckAttempt1++;
-        else if (attemptNum == 2) diag.cmdAckAttempt2++;
-        else                      diag.cmdAckAttempt3++;
+        if      (x.attempt == 1) diag.cmdAckAttempt1++;
+        else if (x.attempt == 2) diag.cmdAckAttempt2++;
+        else                     diag.cmdAckAttempt3++;
         clearError();
 
         char result[22];
-        snprintf(result, sizeof(result), "V%d ACK %d/%d", vId, attemptNum, CMD_MAX_RETRIES + 1);
+        snprintf(result, sizeof(result), "V%d ACK %u/%d", vId, x.attempt, MESH_ATTEMPTS);
         setRetryResult(result);
 
-        StaticJsonDocument<384> mqttDoc;
+        // Same relay_ack as v6.0.
+        StaticJsonDocument<448> mqttDoc;
         mqttDoc["type"]   = "relay_ack";
         mqttDoc["UId"]    = DEVICE_ID;
         mqttDoc["VId"]    = vId;
@@ -1450,56 +1334,59 @@ void handleMeshAck(DynamicJsonDocument& loraDoc, uint8_t srcNode) {
 
         const char* rawStatus = loraDoc["status"] | "";
         mqttDoc["status"]   = rawStatus;
-        // From the command this ack answers, not the status text: a retry can
-        // be answered with "duplicate — already actioned", which names neither.
         char actuator[12];
-        snprintf(actuator, sizeof(actuator), "Valve %s", p.valve);
-        mqttDoc["actuator"] = (char*)actuator;   // char* so the doc keeps a copy
-        mqttDoc["state"]    = strcasestr(rawStatus, "rejected") ? "rejected" : p.cmd;
+        snprintf(actuator, sizeof(actuator), "Valve %s", j.valve);
+        mqttDoc["actuator"] = (const char*)actuator;
+        mqttDoc["state"]    = strcasestr(rawStatus, "rejected") ? "rejected" : j.cmd;
         if (loraDoc.containsKey("FId")) mqttDoc["FId"] = loraDoc["FId"];
         if (loraDoc.containsKey("BId")) mqttDoc["BId"] = loraDoc["BId"];
 
-        // Battery status from the valve node v4.5 (forwarded as-is):
-        //   bat = SoC %  (-1 = INA219 missing)
-        //   bv  = battery volts
-        //   ib  = battery current mA (+ charging, - discharging)
-        //   cs  = 0 discharging, 1 charging, 2 full, 3 idle
         if (loraDoc.containsKey("bat")) mqttDoc["bat"] = loraDoc["bat"];
         if (loraDoc.containsKey("bv"))  mqttDoc["bv"]  = loraDoc["bv"];
         if (loraDoc.containsKey("ib"))  mqttDoc["ib"]  = loraDoc["ib"];
         if (loraDoc.containsKey("cs"))  mqttDoc["cs"]  = loraDoc["cs"];
 
-        serializeJson(mqttDoc, p.ackJson, sizeof(p.ackJson));
-        Serial.printf("✅ ACK matched — VId:%d msgId:%lu attempt:%d/3\n",
-                      vId, (unsigned long)replyTo, attemptNum);
+        Serial.printf("✅ ACK matched — VId:%d msgId:%lu attempt:%u/3\n",
+                      vId, (unsigned long)replyTo, x.attempt);
         if (!loraDoc.containsKey("bv"))
             Serial.printf("⚠️ VId:%d sent no battery readings — check its INA219\n", vId);
-        publishValveAck(idx);
+        queueMqttDoc(publish_topic, mqttDoc, "relay_ack");
+        meshFinish();
         return;
     }
 
     if (strcmp(type, "ota_ack") == 0) {
-        // VId:0 → motor OTA job; VId 1-15 → valve OTA job.
-        bool matches = otaPending.active && otaPending.msgId == replyTo &&
-                       ((vId == 0 && otaPending.motorMesh) ||
-                        (vId >= 1 && !otaPending.motorMesh && otaPending.vId == (uint8_t)vId));
-        if (!matches) {
-            Serial.printf("⏭ Stale/duplicate OTA-ACK VId:%d\n", vId);
-            return;
-        }
         const char* status = loraDoc["status"] | "ok";
         bool ok = (strcasecmp(status, "fail") != 0);
         const char* detail = loraDoc["detail"] | "";
-        Serial.printf("✅ OTA-ACK matched — VId:%d status:%s\n", vId, status);
-        publishOtaAck(ok, otaPending.deviceId, otaPending.nodeType, detail);
-        setRetryResult(ok ? "OTA ACK" : "OTA FAILED");
-        otaPending.active = false;
+
+        bool matches = x.active && j.kind == MK_OTA && j.msgId == replyTo &&
+                       ((vId == 0 && j.motorMesh) || (vId >= 1 && !j.motorMesh && j.vId == vId));
+        if (!matches) {
+            // Node v4.6 reports a failed download after the job has finished.
+            if (!ok) {
+                Serial.printf("⚠️ Late OTA failure from VId:%d — %s\n", vId, detail);
+                publishOtaAck(false, DEVICE_ID, vId == 0 ? "motor node" : "valve node", detail);
+                setRetryResult("OTA FAILED");
+            } else {
+                Serial.printf("⏭ Stale/duplicate OTA-ACK VId:%d\n", vId);
+            }
+            return;
+        }
+
+        Serial.printf("✅ OTA-ACK matched — VId:%d status:%s %s\n", vId, status, detail);
+        publishOtaAck(ok, j.deviceId, j.nodeType, detail);
+        char result[22];
+        if (j.motorMesh) snprintf(result, sizeof(result), ok ? "MOTOR OTA OK" : "MOTOR OTA FAIL");
+        else             snprintf(result, sizeof(result), ok ? "OTA%d OK" : "OTA%d FAIL", vId);
+        setRetryResult(result);
+        meshFinish();
         return;
     }
 }
 
 // =============================================================================
-//  SECTION 23 — POWER HANDLER
+//  SECTION 24 — POWER HANDLER  (unchanged)
 // =============================================================================
 
 void handleLoRaPower(DynamicJsonDocument& loraDoc) {
@@ -1515,27 +1402,17 @@ void handleLoRaPower(DynamicJsonDocument& loraDoc) {
     if (loraDoc["P"].is<float>()) mqttDoc["P"] = loraDoc["P"].as<float>();
     else                          mqttDoc["P"] = loraDoc["P"] | "0";
 
-    MqttPubReq req;
-    strlcpy(req.topic, publish_power_topic, sizeof(req.topic));
-    serializeJson(mqttDoc, req.payload, sizeof(req.payload));
-
-    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) == pdTRUE)
-        Serial.printf("📤 POWER queued: %s\n", req.payload);
-    else {
-        diag.mqttPubFail++;
-        Serial.println("⚠️ mqttPubQueue full — POWER dropped");
-    }
+    queueMqttDoc(publish_power_topic, mqttDoc, "power");
 }
 
 // =============================================================================
-//  SECTION 24 — PACKET PROCESSING
+//  SECTION 25 — PACKET PROCESSING
 // =============================================================================
 
 void processRxPacket(LoRaRxPacket& pkt) {
     String payload((char*)pkt.buf, pkt.len);
     payload.trim();
 
-    // Strip leading garbage bytes before '{'
     int js = payload.indexOf('{');
     if (js < 0 || !payload.endsWith("}")) {
         diag.rxDroppedJson++;
@@ -1553,20 +1430,22 @@ void processRxPacket(LoRaRxPacket& pkt) {
         return;
     }
 
+    const char* type = doc["type"] | "";
+
+    // Our own commands / OTA relayed back by the valve nodes — nothing to do.
+    if (strcmp(type, "command_broadcast") == 0 || strcmp(type, "ota") == 0) return;
+
     Serial.printf("\n📥 LoRa 0x%02X→0x%02X  RSSI:%d  SNR:%.1f\n",
                   pkt.src, pkt.dest, pkt.rssi, pkt.snr);
     Serial.printf("   Payload: %s\n", payload.c_str());
 
-    const char* type = doc["type"] | "";
-
     if (strcmp(type, "ack") == 0) {
-        // Valve-mesh acks carry VId; motor's fixed-address ack does not.
         if (doc.containsKey("VId")) handleMeshAck(doc, pkt.src);
         else                        handleLoRaAck(doc, pkt.src);
     }
     else if (strcmp(type, "ota_ack") == 0) {
         if (doc.containsKey("VId")) handleMeshAck(doc, pkt.src);
-        else                        handleLoRaOtaAck(doc);
+        else Serial.println("⏭ ota_ack without VId — ignoring");
     }
     else if (strcmp(type, "power") == 0) {
         handleLoRaPower(doc);
@@ -1577,46 +1456,22 @@ void processRxPacket(LoRaRxPacket& pkt) {
 }
 
 // =============================================================================
-//  SECTION 25 — APP TASK  (Core 1, pri 1)
+//  SECTION 26 — APP TASK  (Core 1, pri 2)
 // =============================================================================
-
-// NEW — valve mesh retry ticker (15 slots), reuses the SAME msgId on every
-// retry so a node that already executed the command answers a re-delivery
-// with an ack-only duplicate response instead of re-actuating.
-void valveRetryTick() {
-    uint32_t now = millis();
-    for (int i = 0; i < MAX_VALVES; i++) {
-        PendingValve& p = pendingValve[i];
-        if (!p.active)           continue;
-        if (now < p.nextRetryMs) continue;
-
-        if (p.retryCount < CMD_MAX_RETRIES) {
-            p.retryCount++;
-            diag.cmdRetries++;
-            Serial.printf("🔁 [Attempt %d/3] Retry → VId:%d msgId:%lu\n",
-                          p.retryCount + 1, p.vId, (unsigned long)p.msgId);
-            enqueueTxLo(BROADCAST_ID, NODE3_ID, (const uint8_t*)p.payload, p.payloadLen);
-            p.nextRetryMs = now + CMD_RETRY_MS;
-        } else {
-            Serial.printf("❌ All 3 attempts exhausted — VId:%d\n", p.vId);
-            publishValveNoAck(i);
-        }
-    }
-}
 
 void appTask(void* param) {
     static uint32_t lastDiag = 0;
 
     for (;;) {
-        // 1. Drain RX — ACKs clear pending slots
         LoRaRxPacket pkt;
-        while (xQueueReceive(rxQueue, &pkt, 0) == pdTRUE) {
-            processRxPacket(pkt);
-        }
+        while (xQueueReceive(rxQueue, &pkt, 0) == pdTRUE) processRxPacket(pkt);
 
         uint32_t now = millis();
 
-        // 2. Motor retry ticker (unchanged, single slot)
+        // Valve mesh + motor OTA — one job at a time.
+        meshTick();
+
+        // Motor command retries (fixed address).
         {
             PendingCmd& p = pendingCmd[PENDING_MOTOR_IDX];
             if (p.active && now >= p.nextRetryMs) {
@@ -1625,8 +1480,7 @@ void appTask(void* param) {
                     diag.cmdRetries++;
                     Serial.printf("\n🔁 [Attempt %d/3] Retry → node:0x%02X  dev:%s  act:%s\n",
                                   p.retryCount + 1, p.destNode, p.deviceId, p.actuator);
-                    enqueueTxLo(p.destNode, NODE3_ID,
-                                (const uint8_t*)p.payload, p.payloadLen);
+                    enqueueTxLo(p.destNode, NODE3_ID, (const uint8_t*)p.payload, p.payloadLen);
                     p.nextRetryMs = now + CMD_RETRY_MS;
                 } else {
                     Serial.printf("\n❌ All 3 attempts exhausted for %s (%s)\n",
@@ -1636,40 +1490,17 @@ void appTask(void* param) {
             }
         }
 
-        // 2b. Valve mesh retry ticker (15 slots)
-        valveRetryTick();
-
-        // 2c. OTA retry ticker (single in-flight job; mesh or fixed-address)
-        if (otaPending.active && now >= otaPending.nextRetryMs) {
-            if (otaPending.retryCount < OTA_MAX_RETRIES) {
-                otaPending.retryCount++;
-                Serial.printf("\n🔁 [OTA attempt %d/3] Retry → %s dev:%s\n",
-                              otaPending.retryCount + 1,
-                              otaPending.motorMesh ? "MOTOR" : ("VId:" + String(otaPending.vId)).c_str(),
-                              otaPending.deviceId);
-                enqueueTxLo(BROADCAST_ID, NODE3_ID,
-                            (const uint8_t*)otaPending.payload, otaPending.payloadLen);
-                otaPending.nextRetryMs = now + OTA_RETRY_MS;
-            } else {
-                Serial.printf("\n❌ OTA — all 3 attempts exhausted for %s\n", otaPending.deviceId);
-                publishOtaAck(false, otaPending.deviceId, otaPending.nodeType, "no ack after 3 attempts");
-                setRetryResult("OTA NO ACK");
-                otaPending.active = false;
-            }
-        }
-
-        // 3. Diagnostics every 5 min
         if (now - lastDiag >= 5UL * 60 * 1000) {
             lastDiag = now;
             printDiagnostics();
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
 // =============================================================================
-//  SECTION 26 — RADIO REINIT
+//  SECTION 27 — RADIO REINIT
 // =============================================================================
 
 void reinitLoRaRadio() {
@@ -1695,7 +1526,7 @@ void reinitLoRaRadio() {
 }
 
 // =============================================================================
-//  SECTION 27 — OLED DISPLAY HELPERS
+//  SECTION 28 — OLED
 // =============================================================================
 
 int rssiToLoRaBars(int rssi) {
@@ -1706,7 +1537,8 @@ int rssiToLoRaBars(int rssi) {
     return 0;
 }
 
-int csmToGsmBars(int csq) {
+int csqToGsmBars(int csq) {
+    if (csq == 99 || csq <= 0) return 0;   // 99 = not known
     if (csq >= 20) return 4;
     if (csq >= 15) return 3;
     if (csq >= 10) return 2;
@@ -1718,91 +1550,71 @@ void oledDrawSignalBars(int x, int y, int barsFilled, int maxBars = 4) {
     const int barW = 4;
     const int gap  = 2;
     const int maxH = 14;
-
     for (int i = 0; i < maxBars; i++) {
         int h  = 3 + (i * (maxH - 3)) / (maxBars - 1);
         int bx = x + i * (barW + gap);
         int by = y + (maxH - h);
-        if (i < barsFilled)
-            display.fillRect(bx, by, barW, h, SSD1306_WHITE);
-        else
-            display.drawRect(bx, by, barW, h, SSD1306_WHITE);
+        if (i < barsFilled) display.fillRect(bx, by, barW, h, SSD1306_WHITE);
+        else                display.drawRect(bx, by, barW, h, SSD1306_WHITE);
     }
 }
 
-// Builds the retransmission line. Priority: a running countdown, then the
-// last result for RETRY_RESULT_SHOW_MS, then "RETRY:--".
+// "V9 TRY 2/3 14s +3" while a mesh job runs; motor countdown; else last result.
 void buildRetryLine(char* line, size_t size) {
     uint32_t now = millis();
-    int32_t  bestLeft = INT32_MAX;
-    uint8_t  attempt = 0;
-    int      waiting = 0;
-    char     who[8] = "";
+    unsigned waiting = (unsigned)uxQueueMessagesWaiting(meshJobQueue);
 
-    auto consider = [&](const char* name, uint8_t retryCount, uint32_t nextRetryMs) {
-        int32_t left = (int32_t)(nextRetryMs - now);
-        waiting++;
-        if (left < bestLeft) {
-            bestLeft = left;
-            attempt  = retryCount + 1;
-            strlcpy(who, name, sizeof(who));
-        }
-    };
-
-    for (int i = 0; i < MAX_VALVES; i++) {
-        if (!pendingValve[i].active) continue;
-        char name[8];
-        snprintf(name, sizeof(name), "V%d", i + 1);
-        consider(name, pendingValve[i].retryCount, pendingValve[i].nextRetryMs);
+    if (meshTxn.active) {
+        const MeshJob& j = meshTxn.job;
+        int32_t left = (int32_t)(meshTxn.deadline - now);
+        long secs = left <= 0 ? 0 : (left + 999) / 1000;
+        char who[8];
+        if (j.motorMesh)          snprintf(who, sizeof(who), "MOTA");
+        else if (j.kind == MK_OTA) snprintf(who, sizeof(who), "OTA%u", j.vId);
+        else                       snprintf(who, sizeof(who), "V%u", j.vId);
+        int n = snprintf(line, size, "%s TRY %u/%d %lds", who, meshTxn.attempt, MESH_ATTEMPTS, secs);
+        if (waiting && n > 0 && (size_t)n < size) snprintf(line + n, size - n, " +%u", waiting);
+        return;
     }
-    if (pendingCmd[PENDING_MOTOR_IDX].active) {
-        consider("MOTOR", pendingCmd[PENDING_MOTOR_IDX].retryCount,
-                 pendingCmd[PENDING_MOTOR_IDX].nextRetryMs);
+    if (waiting) {
+        snprintf(line, size, "MESH WAIT +%u", waiting);
+        return;
     }
-    if (otaPending.active) {
-        consider("OTA", otaPending.retryCount, otaPending.nextRetryMs);
+    const PendingCmd& mp = pendingCmd[PENDING_MOTOR_IDX];
+    if (mp.active) {
+        int32_t left = (int32_t)(mp.nextRetryMs - now);
+        snprintf(line, size, "MOTOR TRY %u/%d %lds", mp.retryCount + 1, CMD_MAX_RETRIES + 1,
+                 left <= 0 ? 0L : (long)((left + 999) / 1000));
+        return;
     }
-
-    if (waiting > 0) {
-        long seconds = (bestLeft <= 0) ? 0 : (bestLeft + 999) / 1000;
-        int n = snprintf(line, size, "%s TRY %u/%d %lds",
-                         who, attempt, CMD_MAX_RETRIES + 1, seconds);
-        if (waiting > 1 && n > 0 && (size_t)n < size) {
-            snprintf(line + n, size - n, " +%d", waiting - 1);
-        }
-    } else if (retryResult[0] && (int32_t)(retryResultUntil - now) > 0) {
+    if (retryResult[0] && (int32_t)(retryResultUntil - now) > 0) {
         strlcpy(line, retryResult, size);
-    } else {
-        strlcpy(line, "RETRY:--", size);
+        return;
     }
+    strlcpy(line, "RETRY:--", size);
 }
-
-// =============================================================================
-//  SECTION 28 — OLED RENDER
-// =============================================================================
 
 void oledRender() {
     if (!oledOK) return;
 
     display.clearDisplay();
-
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
+
     display.setCursor(0, 0);
     display.print("LoRa");
     oledDrawSignalBars(28, 0, rssiToLoRaBars(dState.loraRSSI));
 
     display.setCursor(72, 0);
     display.print("GSM");
-    oledDrawSignalBars(96, 0, csmToGsmBars(dState.gsmRSSI));
+    oledDrawSignalBars(96, 0, csqToGsmBars(dState.gsmRSSI));
 
     display.setCursor(0, 16);
     display.print("LORA:");
     display.print(dState.loraActive ? "OK" : "FAIL");
-
-    //display.setCursor(64, 16);
-    //display.print("MQTT:");
-    //display.print(dState.mqttOnline ? "OK" : "FAIL");
+    display.setCursor(64, 16);
+    display.print("MQTT:");
+    display.print(dState.mqttOnline ? "OK" : "--");
 
     display.setCursor(0, 28);
     display.print("CMD:");
@@ -1816,10 +1628,8 @@ void oledRender() {
     display.setCursor(0, 52);
     display.print("ERR:");
     uint16_t err = dState.errorCode;
-    if (err == ERR_NONE)
-        display.print("--");
-    else
-        display.print(err);
+    if (err == ERR_NONE) display.print("--");
+    else                 display.print(err);
 
     display.setCursor(80, 52);
     char rssiBuf[12];
@@ -1829,85 +1639,58 @@ void oledRender() {
     display.display();
 }
 
-// =============================================================================
-//  SECTION 29 — DISPLAY TASK  (Core 1, pri 1 — same core as appTask, lower)
-// =============================================================================
-
 void displayTask(void* param) {
     for (;;) {
         oledRender();
-        vTaskDelay(pdMS_TO_TICKS(500));   // refresh 2× per second
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
 // =============================================================================
-//  SECTION 30 — DIAGNOSTICS
+//  SECTION 29 — DIAGNOSTICS
 // =============================================================================
 
 void printDiagnostics() {
-    Serial.println("\n══════════ GATEWAY v5.3 DIAGNOSTICS ══════════");
+    Serial.println("\n══════════ GATEWAY v6.2 (LTE, smart mesh) DIAGNOSTICS ══════════");
     Serial.printf("  LoRa RX total:     %lu\n", diag.rxTotal);
     Serial.printf("  RX dest drops:     %lu\n", diag.rxDroppedDest);
     Serial.printf("  RX JSON drops:     %lu\n", diag.rxDroppedJson);
     Serial.printf("  LoRa TX sent:      %lu\n", diag.txSent);
     Serial.printf("  TX queue full:     %lu\n", diag.txQueueFull);
-    Serial.printf("  CMD retries:       %lu\n", diag.cmdRetries);
-    Serial.printf("  ACK attempt 1:     %lu\n", diag.cmdAckAttempt1);
-    Serial.printf("  ACK attempt 2:     %lu\n", diag.cmdAckAttempt2);
-    Serial.printf("  ACK attempt 3:     %lu\n", diag.cmdAckAttempt3);
-    Serial.printf("  CMD no-ack:        %lu\n", diag.cmdNoAck);
-    Serial.printf("  MQTT pub OK:       %lu\n", diag.mqttPubOk);
-    Serial.printf("  MQTT pub fail:     %lu\n", diag.mqttPubFail);
+    Serial.printf("  Retries:           %lu\n", diag.cmdRetries);
+    Serial.printf("  ACK attempt 1/2/3: %lu / %lu / %lu\n",
+                  diag.cmdAckAttempt1, diag.cmdAckAttempt2, diag.cmdAckAttempt3);
+    Serial.printf("  No-ack:            %lu\n", diag.cmdNoAck);
+    Serial.printf("  Mesh jobs waiting: %u/%d (dropped %lu)\n",
+                  (unsigned)uxQueueMessagesWaiting(meshJobQueue), MESH_JOB_QUEUE_DEPTH,
+                  diag.meshJobsDropped);
+    Serial.printf("  App repeats ignored: %lu\n", diag.meshRepeatsIgnored);
+    Serial.printf("  Mesh timeout:      %lu ms per attempt\n", (unsigned long)meshTimeoutMs());
+    Serial.printf("  MQTT pub OK/fail:  %lu / %lu\n", diag.mqttPubOk, diag.mqttPubFail);
     Serial.printf("  MQTT reconnects:   %lu\n", diag.mqttReconnects);
     Serial.printf("  LTE watchdogs:     %lu\n", diag.lteWatchdogFires);
     Serial.printf("  Radio reinits:     %lu\n", diag.radioReinits);
     Serial.printf("  LoRa RSSI:         %d dBm\n", dState.loraRSSI);
     Serial.printf("  GSM CSQ:           %d\n", dState.gsmRSSI);
-    Serial.printf("  Error code:        %d\n", dState.errorCode);
-    Serial.printf("  MQTT online:       %s\n",  mqttOnline ? "YES" : "NO");
-    Serial.printf("  LoRa active:       %s\n",  dState.loraActive ? "YES" : "NO");
     Serial.printf("  Free heap:         %u B\n", esp_get_free_heap_size());
-    Serial.printf("  rxQueue:           %u/%d\n", uxQueueMessagesWaiting(rxQueue),      RX_QUEUE_DEPTH);
-    Serial.printf("  txHiQueue:         %u/%d\n", uxQueueMessagesWaiting(txHiQueue),    TX_HI_QUEUE_DEPTH);
-    Serial.printf("  txLoQueue:         %u/%d\n", uxQueueMessagesWaiting(txLoQueue),    TX_LO_QUEUE_DEPTH);
-    Serial.printf("  mqttPubQueue:      %u/%d\n", uxQueueMessagesWaiting(mqttPubQueue), MQTT_PUB_QUEUE_DEPTH);
-    Serial.printf("  loraTask    HWM:   %u B\n", uxTaskGetStackHighWaterMark(loraTaskHandle));
-    Serial.printf("  mqttTask    HWM:   %u B\n", uxTaskGetStackHighWaterMark(mqttTaskHandle));
-    Serial.printf("  appTask     HWM:   %u B\n", uxTaskGetStackHighWaterMark(appTaskHandle));
-    Serial.printf("  displayTask HWM:   %u B\n", uxTaskGetStackHighWaterMark(displayTaskHandle));
-
+    Serial.printf("  Stack HWM lora/mqtt/app/disp: %u / %u / %u / %u\n",
+                  uxTaskGetStackHighWaterMark(loraTaskHandle),
+                  uxTaskGetStackHighWaterMark(mqttTaskHandle),
+                  uxTaskGetStackHighWaterMark(appTaskHandle),
+                  uxTaskGetStackHighWaterMark(displayTaskHandle));
+    if (meshTxn.active)
+        Serial.printf("  ⏳ In flight: %s %s%u msgId:%lu attempt %u/%d\n",
+                      meshTxn.job.kind == MK_OTA ? "OTA" : "CMD",
+                      meshTxn.job.motorMesh ? "MOTOR " : "VId:", meshTxn.job.vId,
+                      (unsigned long)meshTxn.job.msgId, meshTxn.attempt, MESH_ATTEMPTS);
     if (pendingCmd[PENDING_MOTOR_IDX].active)
-        Serial.printf("  ⏳ Pending[Motor(0xD2)]: dev=%s  attempt=%d/3  timeout_in=%lu s\n",
-                      pendingCmd[PENDING_MOTOR_IDX].deviceId,
-                      pendingCmd[PENDING_MOTOR_IDX].retryCount + 1,
-                      (pendingCmd[PENDING_MOTOR_IDX].nextRetryMs - millis()) / 1000);
-
-    int activeValves = 0;
-    for (int i = 0; i < MAX_VALVES; i++) {
-        if (!pendingValve[i].active) continue;
-        activeValves++;
-        Serial.printf("  ⏳ Pending[VId:%d]: dev=%s  msgId=%lu  attempt=%d/3  timeout_in=%lu s\n",
-                      pendingValve[i].vId, pendingValve[i].deviceId,
-                      (unsigned long)pendingValve[i].msgId,
-                      pendingValve[i].retryCount + 1,
-                      (pendingValve[i].nextRetryMs - millis()) / 1000);
-    }
-    if (activeValves == 0) Serial.println("  ⏳ Pending valves: none");
-
-    if (otaPending.active) {
-        if (otaPending.motorMesh)
-            Serial.printf("  ⏳ Pending OTA: MOTOR msgId:%lu attempt=%d/3\n",
-                          (unsigned long)otaPending.msgId, otaPending.retryCount + 1);
-        else
-            Serial.printf("  ⏳ Pending OTA: VId:%d msgId:%lu attempt=%d/3\n",
-                          otaPending.vId, (unsigned long)otaPending.msgId, otaPending.retryCount + 1);
-    }
-
-    Serial.println("═══════════════════════════════════════════════\n");
+        Serial.printf("  ⏳ Motor command: attempt %d/3\n",
+                      pendingCmd[PENDING_MOTOR_IDX].retryCount + 1);
+    Serial.println("═══════════════════════════════════════════════════════════\n");
 }
 
 // =============================================================================
-//  SECTION 31 — SETUP
+//  SECTION 30 — SETUP
 // =============================================================================
 
 void setup() {
@@ -1923,8 +1706,8 @@ void setup() {
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(20, 20);
         display.println("AgriInverse GW");
-        display.setCursor(30, 35);
-        display.println("v5.3 starting");
+        display.setCursor(14, 35);
+        display.println("v6.2 LTE mesh");
         display.display();
         Serial.println("✅ OLED ready");
     } else {
@@ -1934,10 +1717,15 @@ void setup() {
     rxQueue      = xQueueCreate(RX_QUEUE_DEPTH,       sizeof(LoRaRxPacket));
     txHiQueue    = xQueueCreate(TX_HI_QUEUE_DEPTH,    sizeof(LoRaTxPacket));
     txLoQueue    = xQueueCreate(TX_LO_QUEUE_DEPTH,    sizeof(LoRaTxPacket));
+    meshTxQueue  = xQueueCreate(MESH_TX_QUEUE_DEPTH,  sizeof(LoRaTxPacket));
+    meshJobQueue = xQueueCreate(MESH_JOB_QUEUE_DEPTH, sizeof(MeshJob));
     mqttPubQueue = xQueueCreate(MQTT_PUB_QUEUE_DEPTH, sizeof(MqttPubReq));
-    otaJobQueue  = xQueueCreate(1, sizeof(SelfOtaJob));   // one in-flight self-OTA at a time
+    otaJobQueue  = xQueueCreate(1, sizeof(SelfOtaJob));
+    jobKeyMutex  = xSemaphoreCreateMutex();
+    memset(jobKeys, 0, sizeof(jobKeys));
 
-    if (!rxQueue || !txHiQueue || !txLoQueue || !mqttPubQueue || !otaJobQueue) {
+    if (!rxQueue || !txHiQueue || !txLoQueue || !meshTxQueue || !meshJobQueue ||
+        !mqttPubQueue || !otaJobQueue || !jobKeyMutex) {
         Serial.println("❌ Queue creation failed — halting");
         while (true) vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -1958,11 +1746,11 @@ void setup() {
 
     xTaskCreatePinnedToCore(loraTask,    "LoRa",    6144,  NULL, 3, &loraTaskHandle,    0);
     xTaskCreatePinnedToCore(mqttTask,    "MQTT",    12288, NULL, 3, &mqttTaskHandle,    1);
-    xTaskCreatePinnedToCore(appTask,     "App",     6144,  NULL, 2, &appTaskHandle,     1);
+    xTaskCreatePinnedToCore(appTask,     "App",     8192,  NULL, 2, &appTaskHandle,     1);
     xTaskCreatePinnedToCore(displayTask, "Display", 4096,  NULL, 1, &displayTaskHandle, 1);
     xTaskCreatePinnedToCore(otaTask,     "OTA",     8192,  NULL, 1, &otaTaskHandle,     1);
 
-    Serial.println("✅ AgriInverse gateway v5.3 started");
+    Serial.println("✅ AgriInverse gateway v6.2 (LTE, smart mesh) started");
     vTaskSuspend(NULL);
 }
 
