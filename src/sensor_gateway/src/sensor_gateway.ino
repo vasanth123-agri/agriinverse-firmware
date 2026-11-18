@@ -54,6 +54,25 @@
    buffer is short, so an undersized buffer shows up as malformed
    JSON at AWS rather than as an error here.
    ----------------------------------------------------------------
+   HEALTH + ACTIVE-CHECK
+   ---------------------
+   device/health  — published automatically every 15 min (and once
+                    right after every MQTT (re)connect):
+     { "type":"health", "UId":"76", "DId":"D1", "status":"active",
+       "gsm":  { "csq":18, "rssi_dbm":-77, "bars":3 },
+       "lora": { "last_rssi":-82, "n1_rssi":-80, "n1_age_s":12,
+                 "n2_rssi":-85, "n2_age_s":40 },
+       "Node1":"active", "Node2":"active", "mqtt":"online",
+       "uptime_s":12345, "free_heap":123456 }
+
+   device/active  — published IMMEDIATELY when the app asks. The app
+                    publishes this on device/cmd:
+     { "UId":"76", "cmd":"check_active" }
+   Reply has the same body as health but "type":"active".
+
+   AWS IoT policy must allow iot:Publish on device/health and
+   device/active for this client.
+   ----------------------------------------------------------------
    Dependencies (Library Manager / platformio.ini):
      adafruit/Adafruit SSD1306 @ ^2.5.7
      adafruit/Adafruit GFX Library @ ^1.11.9
@@ -89,7 +108,7 @@
 
 // ======================== IDENTITY & PINS =======================
 // ⚠️ EDIT THIS LINE for each customer's board before compiling/flashing.
-#define DEVICE_ID    "76"
+#define DEVICE_ID    "34"
 const char client_id[]         = DEVICE_ID;
 
 #define MODEM_RX     16
@@ -116,6 +135,8 @@ const int  broker_port           = 8883;
 
 const char subscribe_topic[]     = "device/cmd";
 const char publish_topic[]       = "device/data";
+const char health_topic[]        = "device/health";
+const char active_topic[]        = "device/active";
 
 // ======================== LoRa RF ===============================
 #define LORA_SF        7
@@ -133,6 +154,7 @@ const char publish_topic[]       = "device/data";
 #define LORA_WATCHDOG_MS   (5UL * 60 * 1000)
 #define LTE_WATCHDOG_MS   (10UL * 60 * 1000)
 #define MAX_MQTT_FAILURES      5
+#define HEALTH_INTERVAL_MS (15UL * 60 * 1000)   // device/health every 15 min
 
 #define OTA_MAX_RETRIES  2
 #define OTA_RETRY_MS     90000UL
@@ -170,6 +192,7 @@ struct LoRaRxPacket {
 };
 
 struct MqttPubReq {
+    char topic[40];                  // device/data, device/health, device/active
     char payload[PUB_PAYLOAD_SIZE];
 };
 
@@ -227,6 +250,14 @@ static volatile unsigned long lastNode2      = 0;
 static volatile unsigned long lastPublishMs  = 0;
 static volatile int           lastLoraRssi   = -120;
 static volatile uint8_t       simSignalBars  = 0;
+static volatile int           simCsq         = 99;    // raw AT+CSQ (0-31, 99 = unknown)
+static volatile int           lastN1Rssi     = -120;  // per-node last packet RSSI
+static volatile int           lastN2Rssi     = -120;
+
+// Set by mqttCallback (device/cmd check_active), serviced by mqttTask.
+// The callback runs inside modem.mqtt_handle(), so it must NOT send
+// AT commands (AT+CSQ) itself — it just raises this flag.
+static volatile bool activeCheckRequested = false;
 
 // Node1 (soil)
 static float n1_N=0,   n1_P=0,   n1_K=0;
@@ -394,10 +425,10 @@ static void flushCmqttPub() {
 // ================================================================
 static uint16_t buildDataJson(char* out, size_t outSize) {
     DynamicJsonDocument doc(PUB_JSON_DOC_SIZE);
-    doc["FId"] = "cmtbikepa03ihoe01xj2j6zgn";
+    doc["FId"] = "cmunyz530005nqk01zaq3h3df";
     doc["Id"]  = "M1";
     doc["UId"] = DEVICE_ID;
-    doc["BId"] = "cmtbikfry03iloe0172em7k2t";
+    doc["BId"] = "cmunyz5oq005rqk01jtz8s86x";
     doc["DId"] = "D1";
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -452,13 +483,87 @@ static uint16_t buildIdleJson(char* out, size_t outSize) {
     return (uint16_t)serializeJson(doc, out, outSize);
 }
 
-static void enqueuePublish(const char* payload) {
+static void enqueuePublishTo(const char* topic, const char* payload, bool urgent = false) {
     MqttPubReq req;
+    strlcpy(req.topic,   topic,   sizeof(req.topic));
     strlcpy(req.payload, payload, sizeof(req.payload));
-    if (xQueueSend(mqttPubQueue, &req, pdMS_TO_TICKS(100)) != pdTRUE) {
+    // urgent = jump the queue (used for the user's "is it active?" click)
+    BaseType_t ok = urgent
+        ? xQueueSendToFront(mqttPubQueue, &req, pdMS_TO_TICKS(100))
+        : xQueueSend       (mqttPubQueue, &req, pdMS_TO_TICKS(100));
+    if (ok != pdTRUE) {
         diagPubFail++;
-        Serial.println("[!] mqttPubQueue full — dropped");
+        Serial.printf("[!] mqttPubQueue full — dropped (%s)\n", topic);
     }
+}
+
+// Default: sensor data topic (keeps all existing call sites unchanged)
+static void enqueuePublish(const char* payload) {
+    enqueuePublishTo(publish_topic, payload);
+}
+
+// ================================================================
+//  GSM signal helpers
+// ================================================================
+static int csqToDbm(int csq) {
+    if (csq < 0 || csq == 99) return 0;     // 0 = unknown
+    return -113 + 2 * csq;                  // 3GPP 27.007 mapping
+}
+
+static uint8_t csqToBars(int q) {
+    if      (q == 99 || q < 0) return 0;
+    else if (q >= 20)          return 4;
+    else if (q >= 14)          return 3;
+    else if (q >= 8)           return 2;
+    else if (q >= 2)           return 1;
+    return 0;
+}
+
+// Sends AT+CSQ — call ONLY from mqttTask (the modem owner), never
+// from inside mqttCallback.
+static void pollSignal() {
+    int q = modem.getSignalQuality();
+    simCsq        = q;
+    simSignalBars = csqToBars(q);
+}
+
+// ================================================================
+//  BUILD HEALTH / ACTIVE JSON  (device/health, device/active)
+// ================================================================
+static uint16_t buildHealthJson(char* out, size_t outSize,
+                                const char* type) {
+    StaticJsonDocument<512> doc;
+    unsigned long now = millis();
+
+    doc["type"]   = type;               // "health" or "active"
+    doc["UId"]    = DEVICE_ID;
+    doc["DId"]    = "D1";
+    doc["status"] = "active";           // gateway is alive if it's sending this
+
+    JsonObject gsm = doc.createNestedObject("gsm");
+    int csq = simCsq;
+    gsm["csq"]      = csq;
+    gsm["rssi_dbm"] = csqToDbm(csq);
+    gsm["bars"]     = simSignalBars;
+
+    JsonObject lora = doc.createNestedObject("lora");
+    lora["last_rssi"] = lastLoraRssi;
+    if (node1Received) {
+        lora["n1_rssi"]  = lastN1Rssi;
+        lora["n1_age_s"] = (now - lastNode1) / 1000UL;
+    }
+    if (node2Received) {
+        lora["n2_rssi"]  = lastN2Rssi;
+        lora["n2_age_s"] = (now - lastNode2) / 1000UL;
+    }
+
+    doc["Node1"]     = isNode1Active() ? "active" : "not received";
+    doc["Node2"]     = isNode2Active() ? "active" : "not received";
+    doc["mqtt"]      = mqttOnline ? "online" : "offline";
+    doc["uptime_s"]  = now / 1000UL;
+    doc["free_heap"] = esp_get_free_heap_size();
+
+    return (uint16_t)serializeJson(doc, out, outSize);
 }
 
 // ================================================================
@@ -646,6 +751,25 @@ void mqttCallback(const char* topic, const uint8_t* payload, uint32_t len) {
     memcpy(buf, payload, n); buf[n] = '\0';
     Serial.printf("MQTT IN [%s]: %s\n", topic, buf);
 
+    // ---- device/cmd : "is it active?" button from the app ----
+    if (strcmp(topic, subscribe_topic) == 0) {
+        StaticJsonDocument<256> cmd;
+        if (deserializeJson(cmd, buf) != DeserializationError::Ok) {
+            Serial.println("[!] device/cmd JSON parse error");
+            return;
+        }
+        const char* uid = cmd["UId"] | "";
+        if (strcmp(uid, DEVICE_ID) != 0) return;          // not for us
+
+        const char* c = cmd["cmd"] | "";
+        if (strcasecmp(c, "check_active") == 0 ||
+            strcasecmp(c, "active") == 0) {
+            activeCheckRequested = true;   // mqttTask replies on device/active
+            Serial.println("Active-check requested");
+        }
+        return;
+    }
+
     if (strcmp(topic, "OTA/mode") != 0) return;
 
     DynamicJsonDocument doc(512);
@@ -784,6 +908,8 @@ void mqttTask(void* param) {
     uint32_t lastSigPoll   = 0;
     bool     notified      = false;
     uint8_t  failCount     = 0;
+    uint32_t lastHealthMs  = 0;
+    bool     healthDue     = false;   // set on (re)connect -> send one right away
 
     for (;;) {
         uint32_t now = millis();
@@ -795,23 +921,41 @@ void mqttTask(void* param) {
 
         if (state == CONNECTED && now - lastSigPoll >= 30000UL) {
             lastSigPoll = now;
-            int q = modem.getSignalQuality();
-            if      (q == 99 || q < 0) simSignalBars = 0;
-            else if (q >= 20)           simSignalBars = 4;
-            else if (q >= 14)           simSignalBars = 3;
-            else if (q >= 8)            simSignalBars = 2;
-            else if (q >= 2)            simSignalBars = 1;
-            else                        simSignalBars = 0;
+            pollSignal();
+        }
+
+        // ---- device/active : user clicked "check active" ----
+        if (state == CONNECTED && activeCheckRequested) {
+            activeCheckRequested = false;
+            pollSignal();                       // fresh CSQ, not the 30s-old one
+            lastSigPoll = millis();
+            char hb[512];
+            buildHealthJson(hb, sizeof(hb), "active");
+            enqueuePublishTo(active_topic, hb, true);   // front of queue
+            Serial.printf("Active reply enqueued: %s\n", hb);
+        }
+
+        // ---- device/health : every 15 min + once after (re)connect ----
+        if (state == CONNECTED &&
+            (healthDue || now - lastHealthMs >= HEALTH_INTERVAL_MS)) {
+            healthDue    = false;
+            lastHealthMs = now;
+            pollSignal();
+            lastSigPoll = millis();
+            char hb[512];
+            buildHealthJson(hb, sizeof(hb), "health");
+            enqueuePublishTo(health_topic, hb);
+            Serial.printf("Health enqueued: %s\n", hb);
         }
 
         if (state == CONNECTED) {
             MqttPubReq req;
             if (xQueueReceive(mqttPubQueue, &req, 0) == pdTRUE) {
-                if (modem.mqtt_publish(0, publish_topic, req.payload, 0)) {
+                if (modem.mqtt_publish(0, req.topic, req.payload, 0)) {
                     diagPubOk++;
                     failCount     = 0;
                     lastPublishMs = millis();
-                    Serial.println("[OK] Published: " + String(req.payload));
+                    Serial.printf("[OK] Published [%s]: %s\n", req.topic, req.payload);
                     flushCmqttPub();
                 } else {
                     diagPubFail++;
@@ -872,7 +1016,8 @@ void mqttTask(void* param) {
                 break;
             }
             if (!notified) {
-                notified = true;
+                notified  = true;
+                healthDue = true;     // report health as soon as we're back online
                 Serial.println("MQTT online");
                 if (pendingData) {
                     pendingData = false;
@@ -949,6 +1094,7 @@ void appTask(void* param) {
                     n1_ST = tmp["ST"] | 0.0f;
                     n1_SM = tmp["SM"] | 0.0f;
                     n1_EC = tmp["EC"] | 0.0f;
+                    lastN1Rssi    = pkt.rssi;
                     node1Received = true;
                     lastNode1     = millis();
                     idleSent      = false;
@@ -993,6 +1139,7 @@ void appTask(void* param) {
                     n2_BP    = tmp["BP"]  | -1;
                     n2_CHG   = tmp["CHG"] | -2;
 
+                    lastN2Rssi    = pkt.rssi;
                     node2Received = true;
                     lastNode2     = millis();
                     idleSent      = false;
