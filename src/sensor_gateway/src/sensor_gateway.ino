@@ -108,7 +108,7 @@
 
 // ======================== IDENTITY & PINS =======================
 // ⚠️ EDIT THIS LINE for each customer's board before compiling/flashing.
-#define DEVICE_ID    "34"
+#define DEVICE_ID    "77"
 const char client_id[]         = DEVICE_ID;
 
 #define MODEM_RX     16
@@ -425,10 +425,10 @@ static void flushCmqttPub() {
 // ================================================================
 static uint16_t buildDataJson(char* out, size_t outSize) {
     DynamicJsonDocument doc(PUB_JSON_DOC_SIZE);
-    doc["FId"] = "cmunyz530005nqk01zaq3h3df";
+    doc["FId"] = "cmuntoqu107vzny01d7f4rjcz";
     doc["Id"]  = "M1";
     doc["UId"] = DEVICE_ID;
-    doc["BId"] = "cmunyz5oq005rqk01jtz8s86x";
+    doc["BId"] = "cmuntorj607w3ny01a1h1dao1";
     doc["DId"] = "D1";
 
     if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
